@@ -14,6 +14,12 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
+from search import (
+    search_messages as search_messages_fulltext,
+    rebuild_index,
+    clear_index,
+    get_search_stats,
+)
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -247,6 +253,78 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def search_messages(
+    query: str,
+    limit: int = 20,
+    page: int = 0,
+    sort_by: str = "timestamp",
+    reverse: bool = True
+) -> List[Dict[str, Any]]:
+    """Full-text search across WhatsApp messages. Use this tool to find arbitrary information or unestructured data on whatsapp messages.
+        
+    Args:
+        query: Search query string (supports wildcards and boolean operators)
+        limit: Maximum number of results to return (default 20)
+        page: Page number for pagination (default 0)
+        sort_by: Field to sort by - "timestamp" or "relevance" (default "timestamp")
+        reverse: Whether to reverse sort order (default True - newest first)
+    
+    Returns:
+        List of matching messages with metadata and relevance information
+    """
+    results = search_messages_fulltext(
+        query=query,
+        limit=limit,
+        page=page,
+        sort_by=sort_by,
+        reverse=reverse
+    )
+    return results
+
+@mcp.tool()
+def rebuild_search_index() -> Dict[str, Any]:
+    """Rebuild the full-text search index from the WhatsApp database.
+    
+    Call this if search results seem outdated or if you want to force
+    a reindex of all messages.
+    
+    Returns:
+        Status dictionary with success flag and statistics
+    """
+    success = rebuild_index()
+    stats = get_search_stats()
+    
+    return {
+        "success": success,
+        "message": "Search index rebuilt successfully" if success else "Failed to rebuild search index",
+        "stats": stats
+    }
+
+@mcp.tool()
+def get_search_index_info() -> Dict[str, Any]:
+    """Get information about the current search index status.
+    
+    Returns:
+        Dictionary with index status, path, document count, and last update time
+    """
+    return get_search_stats()
+
+@mcp.tool()
+def clear_search_index() -> Dict[str, Any]:
+    """Clear the search index to free up disk space.
+    
+    The index will be automatically rebuilt on the next search.
+    
+    Returns:
+        Status dictionary with success flag
+    """
+    success = clear_index()
+    return {
+        "success": success,
+        "message": "Search index cleared successfully" if success else "Failed to clear search index"
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server
