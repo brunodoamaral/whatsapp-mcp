@@ -1,3 +1,6 @@
+## Credits
+This is a modified version of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) with fixes for the latest whatsmeow API compatibility.
+
 # WhatsApp MCP Server
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
