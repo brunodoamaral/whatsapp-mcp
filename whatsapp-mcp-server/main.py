@@ -12,7 +12,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    search_messages_fulltext as whatsapp_search_messages_fulltext,
+    set_chat_mute as whatsapp_set_chat_mute
 )
 
 # Initialize FastMCP server
@@ -247,6 +249,86 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def search_messages(
+    query: str,
+    chat_jid: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0
+) -> str:
+    """Search WhatsApp messages using full-text search with custom scoring.
+    
+    Messages are ranked by relevance with custom scoring:
+    - Muted chats are penalized (10% of normal score)
+    - Active chats (where you send more messages) are boosted
+    - Results are sorted by score then timestamp
+    
+    Args:
+        query: Search query string to match against message content, sender, and filenames
+        chat_jid: Optional chat JID to filter results to a specific chat
+        limit: Maximum number of results to return (default 20, max 100)
+        offset: Pagination offset for results (default 0)
+    
+    Returns:
+        Formatted text output with search results
+    """
+    success, result = whatsapp_search_messages_fulltext(query, chat_jid, limit, offset)
+    
+    if not success:
+        return f"Search failed: {result}"
+    
+    # Format the results for display
+    output = f"Search results for '{result.get('query', query)}':\n"
+    output += f"Found {result.get('total', 0)} message(s)\n\n"
+    
+    results = result.get('results', [])
+    if not results:
+        return output + "No messages found."
+    
+    for idx, msg in enumerate(results, 1):
+        timestamp = msg.get('timestamp', 'Unknown')
+        sender = msg.get('sender', 'Unknown')
+        content = msg.get('content', '')
+        chat_jid_result = msg.get('chat_jid', 'Unknown')
+        media_type = msg.get('media_type')
+        filename = msg.get('filename')
+        score = msg.get('score', 0)
+        
+        output += f"[{idx}] [{timestamp}] {sender} (score: {score:.2f})\n"
+        
+        if media_type:
+            output += f"    [Media: {media_type}"
+            if filename:
+                output += f" - {filename}"
+            output += "]\n"
+        
+        if content:
+            output += f"    {content}\n"
+        
+        output += f"    Chat: {chat_jid_result}\n\n"
+    
+    return output
+
+@mcp.tool()
+def toggle_chat_mute(chat_jid: str, muted: bool) -> Dict[str, Any]:
+    """Mute or unmute notifications for a WhatsApp chat.
+    
+    When a chat is muted, its messages will receive a reduced score in full-text search results.
+    
+    Args:
+        chat_jid: The JID of the chat to mute or unmute
+        muted: True to mute the chat, False to unmute
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, message = whatsapp_set_chat_mute(chat_jid, muted)
+    
+    return {
+        "success": success,
+        "message": message
+    }
 
 if __name__ == "__main__":
     # Initialize and run the server

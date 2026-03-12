@@ -755,3 +755,81 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+def search_messages_fulltext(
+    query: str,
+    chat_jid: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0
+) -> Tuple[bool, Any]:
+    """Search messages using full-text search with custom scoring.
+    
+    Args:
+        query: Search query string
+        chat_jid: Optional chat JID to filter results
+        limit: Maximum number of results (default 20)
+        offset: Pagination offset (default 0)
+    
+    Returns:
+        Tuple of (success: bool, results: dict or error message)
+    """
+    try:
+        if not query:
+            return False, "Query cannot be empty"
+        
+        url = f"{WHATSAPP_API_BASE_URL}/search"
+        params = {
+            "q": query,
+            "limit": limit,
+            "offset": offset
+        }
+        
+        if chat_jid:
+            params["chat_jid"] = chat_jid
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return True, result
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+    
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def set_chat_mute(chat_jid: str, muted: bool) -> Tuple[bool, str]:
+    """Set mute status for a chat.
+    
+    Args:
+        chat_jid: The JID of the chat to mute/unmute
+        muted: True to mute, False to unmute
+    
+    Returns:
+        Tuple of (success: bool, message: str)
+    """
+    try:
+        if not chat_jid:
+            return False, "Chat JID cannot be empty"
+        
+        url = f"{WHATSAPP_API_BASE_URL}/chats/{chat_jid}/mute"
+        payload = {"muted": muted}
+        
+        response = requests.post(url, json=payload)
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+    
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
