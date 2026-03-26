@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,6 +36,17 @@ import (
 
 	"github.com/blevesearch/bleve/v2"
 )
+
+// package-level logger, initialized in main()
+var logger waLog.Logger
+var traceEnabled bool
+
+// tracef logs only when LOG_LEVEL=TRACE
+func tracef(format string, args ...interface{}) {
+	if traceEnabled {
+		logger.Debugf("[TRACE] "+format, args...)
+	}
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -75,10 +87,11 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	// Create tables if they don't exist
 	_, err = db.Exec(`
@@ -198,7 +211,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 	err = store.index.Index(docID, doc)
 	if err != nil {
 		// Log error but don't fail the operation
-		fmt.Printf("Failed to index message %s: %v\n", docID, err)
+		logger.Warnf("Failed to index message %s: %v", docID, err)
 	}
 
 	return nil
@@ -274,7 +287,7 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 
 // Re-index all messages from database to bleve
 func (store *MessageStore) ReIndexAllMessages() error {
-	fmt.Println("Starting re-indexing of all messages...")
+	logger.Infof("Starting re-indexing of all messages...")
 
 	rows, err := store.db.Query(`
 		SELECT id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename
@@ -294,7 +307,7 @@ func (store *MessageStore) ReIndexAllMessages() error {
 
 		err := rows.Scan(&id, &chatJID, &sender, &fullName, &content, &timestamp, &isFromMe, &mediaType, &filename)
 		if err != nil {
-			fmt.Printf("Error scanning message: %v\n", err)
+			logger.Warnf("Error scanning message: %v", err)
 			continue
 		}
 
@@ -313,13 +326,13 @@ func (store *MessageStore) ReIndexAllMessages() error {
 
 		err = store.index.Index(docID, doc)
 		if err != nil {
-			fmt.Printf("Failed to index message %s: %v\n", docID, err)
+			logger.Warnf("Failed to index message %s: %v", docID, err)
 		} else {
 			indexed++
 		}
 	}
 
-	fmt.Printf("Re-indexed %d messages\n", indexed)
+	logger.Infof("Re-indexed %d messages", indexed)
 	return nil
 }
 
@@ -603,7 +616,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		logger.Debugf("Media uploaded: %v", resp)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -633,7 +646,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
-				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+				logger.Warnf("Not an Ogg Opus file: %s", mimeType)
 			}
 
 			msg.AudioMessage = &waProto.AudioMessage{
@@ -748,7 +761,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if msg.Message != nil && msg.Message.MessageContextInfo != nil {
 		// This is a forwarded message - the chat JID should be the current chat, not the original
 		// msg.Info.Chat should already contain the correct current chat JID
-		logger.Infof("Detected forwarded message from %s to chat %s", sender, chatJID)
+		tracef("Detected forwarded message from %s to chat %s", sender, chatJID)
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
@@ -801,9 +814,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			logger.Debugf("[%s] %s %s: [%s: %s] %s", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			logger.Debugf("[%s] %s %s: %s", timestamp, direction, sender, content)
 		}
 	}
 }
@@ -948,7 +961,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	logger.Infof("Attempting to download media for message %s in chat %s...", messageID, chatJID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -989,7 +1002,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	logger.Infof("Successfully downloaded %s media to %s (%d bytes)", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -1041,11 +1054,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		logger.Debugf("Received request to send message: %s %s", req.Message, req.MediaPath)
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		logger.Debugf("Message sent: success=%v %s", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -1210,19 +1223,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	logger.Infof("Starting REST API server on %s...", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			logger.Errorf("REST API server error: %v", err)
 		}
 	}()
 }
 
 func main() {
 	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "INFO"
+	}
+	if strings.ToUpper(logLevel) == "TRACE" {
+		traceEnabled = true
+		logLevel = "DEBUG"
+	}
+	logger = waLog.Stdout("Client", logLevel, true)
 	logger.Infof("Starting WhatsApp client...")
 
 	// Update WhatsApp version to latest
@@ -1236,7 +1257,7 @@ func main() {
 	}
 
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := waLog.Stdout("Database", logLevel, true)
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -1296,7 +1317,7 @@ func main() {
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.Contact:
-			logger.Infof("Syncing Contacts!")
+			tracef("Syncing Contacts!")
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -1312,7 +1333,7 @@ func main() {
 			}
 			logger.Infof("Contacts synced successfully ✓")
 			allContacts, err := client.Store.Contacts.GetAllContacts(context.Background())
-			logger.Infof("Total contacts in store1: %d, error: %s", len(allContacts), err)
+			logger.Infof("Total contacts in store1: %d, error: %v", len(allContacts), err)
 
 			client.ManualHistorySyncDownload = false // Now we can allow history sync to process messages
 
@@ -1325,7 +1346,7 @@ func main() {
 			}
 			logger.Infof("Critical block synced ✓")
 			allContacts2, err := client.Store.Contacts.GetAllContacts(context.Background())
-			logger.Infof("Total contacts in store2: %d, error: %s", len(allContacts2), err)
+			logger.Infof("Total contacts in store2: %d, error: %v", len(allContacts2), err)
 
 			// STEP 3: Sync other patches
 			logger.Infof("Step 3: Syncing regular patches...")
@@ -1346,7 +1367,7 @@ func main() {
 			logger.Infof("Step 4: Ready for history sync...")
 
 			allContacts3, err := client.Store.Contacts.GetAllContacts(context.Background())
-			logger.Infof("Total contacts in store3: %d, error: %s", len(allContacts3), err)
+			logger.Infof("Total contacts in store3: %d, error: %v", len(allContacts3), err)
 
 			// History sync notifications will now be processed
 		case *events.LoggedOut:
@@ -1370,7 +1391,7 @@ func main() {
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				logger.Infof("Scan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true
@@ -1381,7 +1402,7 @@ func main() {
 		// Wait for connection
 		select {
 		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
+			logger.Infof("Successfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
 			logger.Errorf("Timeout waiting for QR code scan")
 			return
@@ -1404,7 +1425,7 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	logger.Infof("Connected to WhatsApp!")
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
@@ -1413,12 +1434,12 @@ func main() {
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	logger.Infof("REST server is running. Press Ctrl+C to disconnect and exit.")
 
 	// Wait for termination signal
 	<-exitChan
 
-	fmt.Println("Disconnecting...")
+	logger.Infof("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
 }
@@ -1430,7 +1451,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 	if jid.Server == "g.us" {
 		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
+		tracef("Getting name for group: %s", chatJID)
 
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
@@ -1472,19 +1493,19 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
+		tracef("Using group name: %s", name)
 	} else {
 		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
+		tracef("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name) - try this first
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-			logger.Infof("Found contact name: %s", name)
+			tracef("Found contact name: %s", name)
 		} else if contact.PushName != "" {
 			name = contact.PushName
-			logger.Infof("Using push name: %s", name)
+			tracef("Using push name: %s", name)
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
@@ -1501,7 +1522,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		_, err := messageStore.db.Exec("INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 			chatJID, name, time.Now())
 		if err != nil {
-			logger.Warnf("Failed to update chat name in database: %v", err)
+			logger.Warnf("Failed to update chat name in database: %v\n%s", err, debug.Stack())
 		}
 	}
 
@@ -1510,7 +1531,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	logger.Infof("Received history sync event with %d conversations", len(historySync.Data.Conversations))
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1576,7 +1597,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				tracef("Message content: %v, Media Type: %v", content, mediaType)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -1664,10 +1685,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					syncedCount++
 					// Log successful message storage
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+						tracef("Stored message: [%s] %s -> %s: [%s: %s] %s",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
+						tracef("Stored message: [%s] %s -> %s: %s",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
@@ -1675,30 +1696,30 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	logger.Infof("History sync complete. Stored %d messages.", syncedCount)
 }
 
 // Request history sync from the server
 func requestHistorySync(client *whatsmeow.Client) {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+		logger.Errorf("Client is not initialized. Cannot request history sync.")
 		return
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		logger.Errorf("Client is not connected. Please ensure you are connected to WhatsApp first.")
 		return
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+		logger.Errorf("Client is not logged in. Please scan the QR code first.")
 		return
 	}
 
 	// Build and send a history sync request
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		logger.Errorf("Failed to build history sync request.")
 		return
 	}
 
@@ -1708,9 +1729,9 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}, historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
+		logger.Errorf("Failed to request history sync: %v", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		logger.Infof("History sync requested. Waiting for server response...")
 	}
 }
 
@@ -1773,7 +1794,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
 					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
 					foundOpusHead = true
-					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
+					logger.Debugf("Found OpusHead: sampleRate=%d, preSkip=%d", sampleRate, preSkip)
 				}
 			}
 		}
@@ -1788,7 +1809,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	}
 
 	if !foundOpusHead {
-		fmt.Println("Warning: OpusHead not found, using default values")
+		logger.Warnf("OpusHead not found, using default values")
 	}
 
 	// Calculate duration based on granule position
@@ -1796,11 +1817,10 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		// Formula for duration: (lastGranule - preSkip) / sampleRate
 		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
 		duration = uint32(math.Ceil(durationSeconds))
-		fmt.Printf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)\n",
-			durationSeconds, lastGranule)
+		logger.Debugf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)", durationSeconds, lastGranule)
 	} else {
 		// Fallback to rough estimation if granule position not found
-		fmt.Println("Warning: No valid granule position found, using estimation")
+		logger.Warnf("No valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0 // Very rough approximation
 		duration = uint32(durationEstimate)
 	}
@@ -1815,8 +1835,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	// Generate waveform
 	waveform = placeholderWaveform(duration)
 
-	fmt.Printf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes\n",
-		len(data), duration, len(waveform))
+	logger.Debugf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes", len(data), duration, len(waveform))
 
 	return duration, waveform, nil
 }
