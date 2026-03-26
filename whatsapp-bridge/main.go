@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,27 +25,58 @@ import (
 	"bytes"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/blevesearch/bleve/v2"
 )
+
+// package-level logger, initialized in main()
+var logger waLog.Logger
+var traceEnabled bool
+
+// tracef logs only when LOG_LEVEL=TRACE
+func tracef(format string, args ...interface{}) {
+	if traceEnabled {
+		logger.Debugf("[TRACE] "+format, args...)
+	}
+}
 
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
 	Sender    string
+	FullName  string
 	Content   string
 	IsFromMe  bool
 	MediaType string
 	Filename  string
 }
 
+// MessageDocument represents a message for bleve indexing
+type MessageDocument struct {
+	ID        string    `json:"id"`
+	ChatJID   string    `json:"chat_jid"`
+	Sender    string    `json:"sender"`
+	FullName  string    `json:"full_name"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+	IsFromMe  bool      `json:"is_from_me"`
+	MediaType string    `json:"media_type"`
+	Filename  string    `json:"filename"`
+	Score     float64   `json:"score,omitempty"`
+}
+
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db    *sql.DB
+	index bleve.Index
 }
 
 // Initialize message store
@@ -54,23 +87,26 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
+	db.SetMaxOpenConns(1)
 
 	// Create tables if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			muted BOOLEAN DEFAULT FALSE
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
 			sender TEXT,
+			full_name TEXT,
 			content TEXT,
 			timestamp TIMESTAMP,
 			is_from_me BOOLEAN,
@@ -90,11 +126,37 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	// Initialize bleve index
+	indexPath := "store/messages.bleve"
+	index, err := bleve.Open(indexPath)
+	if err == bleve.ErrorIndexPathDoesNotExist {
+		// Create new index
+		mapping := bleve.NewIndexMapping()
+		// Configure text field mapping for content
+		textFieldMapping := bleve.NewTextFieldMapping()
+		textFieldMapping.Analyzer = "en"
+		mapping.DefaultMapping.AddFieldMappingsAt("content", textFieldMapping)
+		mapping.DefaultMapping.AddFieldMappingsAt("sender", textFieldMapping)
+		mapping.DefaultMapping.AddFieldMappingsAt("filename", textFieldMapping)
+
+		index, err = bleve.New(indexPath, mapping)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to create bleve index: %v", err)
+		}
+	} else if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to open bleve index: %v", err)
+	}
+
+	return &MessageStore{db: db, index: index}, nil
 }
 
 // Close the database connection
 func (store *MessageStore) Close() error {
+	if store.index != nil {
+		store.index.Close()
+	}
 	return store.db.Close()
 }
 
@@ -107,8 +169,16 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// Helper to dereference string pointers for database storage
+func stringPtrValue(s *string) interface{} {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
 // Store a message in the database
-func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
@@ -117,17 +187,60 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Index message in bleve
+	docID := chatJID + ":" + id
+	doc := MessageDocument{
+		ID:        id,
+		ChatJID:   chatJID,
+		Sender:    sender,
+		FullName:  fullName,
+		Content:   content,
+		Timestamp: timestamp,
+		IsFromMe:  isFromMe,
+		MediaType: mediaType,
+		Filename:  filename,
+	}
+	err = store.index.Index(docID, doc)
+	if err != nil {
+		// Log error but don't fail the operation
+		logger.Warnf("Failed to index message %s: %v", docID, err)
+	}
+
+	return nil
+}
+
+// Get a single message by ID
+func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, error) {
+	var msg Message
+	var timestamp time.Time
+	err := store.db.QueryRow(
+		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("message not found")
+		}
+		return nil, err
+	}
+
+	msg.Time = timestamp
+	return &msg, nil
 }
 
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -139,7 +252,7 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		err := rows.Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
 		if err != nil {
 			return nil, err
 		}
@@ -170,6 +283,235 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	}
 
 	return chats, nil
+}
+
+// Re-index all messages from database to bleve
+func (store *MessageStore) ReIndexAllMessages() error {
+	logger.Infof("Starting re-indexing of all messages...")
+
+	const batchSize = 500
+	offset := 0
+	indexed := 0
+
+	for {
+		rows, err := store.db.Query(`
+			SELECT id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename
+			FROM messages
+			WHERE content != '' OR media_type != ''
+			ORDER BY rowid
+			LIMIT ? OFFSET ?
+		`, batchSize, offset)
+		if err != nil {
+			return fmt.Errorf("failed to query messages: %v", err)
+		}
+
+		count := 0
+		for rows.Next() {
+			var id, chatJID, sender, fullName, content, mediaType, filename string
+			var timestamp time.Time
+			var isFromMe bool
+
+			err := rows.Scan(&id, &chatJID, &sender, &fullName, &content, &timestamp, &isFromMe, &mediaType, &filename)
+			if err != nil {
+				logger.Warnf("Error scanning message: %v", err)
+				continue
+			}
+
+			docID := chatJID + ":" + id
+			doc := MessageDocument{
+				ID:        id,
+				ChatJID:   chatJID,
+				Sender:    sender,
+				FullName:  fullName,
+				Content:   content,
+				Timestamp: timestamp,
+				IsFromMe:  isFromMe,
+				MediaType: mediaType,
+				Filename:  filename,
+			}
+
+			err = store.index.Index(docID, doc)
+			if err != nil {
+				logger.Warnf("Failed to index message %s: %v", docID, err)
+			} else {
+				indexed++
+			}
+			count++
+		}
+		rows.Close()
+
+		if count < batchSize {
+			break
+		}
+		offset += batchSize
+	}
+
+	logger.Infof("Re-indexed %d messages", indexed)
+	return nil
+}
+
+// Get mute status for a chat
+func (store *MessageStore) IsChatMuted(chatJID string) (bool, error) {
+	var muted bool
+	err := store.db.QueryRow("SELECT muted FROM chats WHERE jid = ?", chatJID).Scan(&muted)
+	if err == sql.ErrNoRows {
+		return false, nil // Default to not muted
+	}
+	return muted, err
+}
+
+// Set mute status for a chat
+func (store *MessageStore) SetChatMuted(chatJID string, muted bool) error {
+	_, err := store.db.Exec("UPDATE chats SET muted = ? WHERE jid = ?", muted, chatJID)
+	return err
+}
+
+// calculateUserMessageRatio calculates the ratio of user's messages in a chat
+func (store *MessageStore) calculateUserMessageRatio(chatJID string) (float64, error) {
+	var totalMessages, userMessages int
+	err := store.db.QueryRow(`
+		SELECT COUNT(*) as total, 
+		       SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) as user
+		FROM messages 
+		WHERE chat_jid = ?
+	`, chatJID).Scan(&totalMessages, &userMessages)
+
+	if err != nil {
+		return 0, err
+	}
+
+	if totalMessages == 0 {
+		return 0, nil
+	}
+
+	return float64(userMessages) / float64(totalMessages), nil
+}
+
+// CustomRescorer implements custom scoring for search results
+type CustomRescorer struct {
+	store *MessageStore
+}
+
+// Rescore applies custom scoring logic
+func (r *CustomRescorer) Rescore(ctx context.Context, searchResult *bleve.SearchResult) error {
+	// Cache for chat ratios to avoid repeated DB queries
+	chatRatios := make(map[string]float64)
+
+	for _, hit := range searchResult.Hits {
+		// Extract chat_jid from document ID (format: chat_jid:message_id)
+		parts := strings.SplitN(hit.ID, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		chatJID := parts[0]
+
+		// Check if chat is muted
+		muted, err := r.store.IsChatMuted(chatJID)
+		if err == nil && muted {
+			// Penalize muted chats
+			hit.Score *= 0.1
+		}
+
+		// Get or calculate user message ratio for this chat
+		ratio, exists := chatRatios[chatJID]
+		if !exists {
+			ratio, err = r.calculateUserMessageRatio(chatJID)
+			if err != nil {
+				ratio = 0.5 // Default fallback
+			}
+			chatRatios[chatJID] = ratio
+		}
+
+		// Boost by ratio (higher ratio = higher boost)
+		hit.Score *= (1.0 + ratio)
+	}
+
+	return nil
+}
+
+// calculateUserMessageRatio calculates the ratio of user's messages in a chat
+func (r *CustomRescorer) calculateUserMessageRatio(chatJID string) (float64, error) {
+	var totalMessages, userMessages int
+	err := r.store.db.QueryRow(`
+		SELECT COUNT(*) as total, 
+		       SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) as user
+		FROM messages 
+		WHERE chat_jid = ?
+	`, chatJID).Scan(&totalMessages, &userMessages)
+
+	if err != nil {
+		return 0, err
+	}
+
+	if totalMessages == 0 {
+		return 0, nil
+	}
+
+	return float64(userMessages) / float64(totalMessages), nil
+}
+
+// Search messages using bleve with custom scoring
+func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, offset int) ([]Message, error) {
+	var searchRequest *bleve.SearchRequest
+
+	if chatJID != "" {
+		chatTermQuery := bleve.NewTermQuery(chatJID)
+		chatTermQuery.SetField("chat_jid")
+		booleanQuery := bleve.NewBooleanQuery()
+		booleanQuery.AddMust(bleve.NewMatchQuery(queryStr))
+		booleanQuery.AddMust(chatTermQuery)
+		searchRequest = bleve.NewSearchRequest(booleanQuery)
+	} else {
+		searchRequest = bleve.NewSearchRequest(bleve.NewMatchQuery(queryStr))
+	}
+
+	searchRequest.Size = limit
+	searchRequest.From = offset
+	searchRequest.SortBy([]string{"-_score", "-timestamp"})
+
+	// Execute search
+	searchResult, err := store.index.Search(searchRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert results to MessageDocument and apply custom scoring
+	var results []Message
+	chatRatios := make(map[string]float64)
+
+	for _, hit := range searchResult.Hits {
+		// Decompose hit.ID (docID) := chatJID + ":" + id
+		idParts := strings.Split(hit.ID, ":")
+		chatJID := idParts[0]
+		messageID := idParts[1]
+		doc, err := store.GetMessage(messageID, chatJID)
+		if err != nil {
+			continue
+		}
+
+		// Apply custom scoring
+		muted, err := store.IsChatMuted(chatJID)
+		if err == nil && muted {
+			hit.Score *= 0.1
+		}
+
+		// Get or calculate user message ratio
+		ratio, exists := chatRatios[chatJID]
+		if !exists {
+			ratio, err = store.calculateUserMessageRatio(chatJID)
+			if err != nil {
+				ratio = 0.5
+			}
+			chatRatios[chatJID] = ratio
+		}
+
+		hit.Score *= (1.0 + ratio)
+		// doc.Score = hit.Score
+
+		results = append(results, *doc)
+	}
+
+	return results, nil
 }
 
 // Extract text content from a message
@@ -288,7 +630,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		logger.Debugf("Media uploaded: %v", resp)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -318,7 +660,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
-				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
+				logger.Warnf("Not an Ogg Opus file: %s", mimeType)
 			}
 
 			msg.AudioMessage = &waProto.AudioMessage{
@@ -413,14 +755,36 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+	var senderName string
+
+	// Just use contact info (full name) - try this first
+	contact, err := client.Store.Contacts.GetContact(context.Background(), msg.Info.Sender)
+	if err == nil && contact.FullName != "" {
+		senderName = contact.FullName
+	} else if contact.PushName != "" {
+		senderName = contact.PushName
+	} else if sender != "" {
+		// Fallback to sender
+		senderName = sender
+	} else {
+		// Last fallback to JID
+		senderName = msg.Info.Sender.User
+	}
+
+	// Check if this is a forwarded message and adjust chat JID if needed
+	if msg.Message != nil && msg.Message.MessageContextInfo != nil {
+		// This is a forwarded message - the chat JID should be the current chat, not the original
+		// msg.Info.Chat should already contain the correct current chat JID
+		tracef("Detected forwarded message from %s to chat %s", sender, chatJID)
+	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
-	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
-	if err != nil {
-		logger.Warnf("Failed to store chat: %v", err)
+	errChat := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
+	if errChat != nil {
+		logger.Warnf("Failed to store chat: %v", errChat)
 	}
 
 	// Extract text content
@@ -434,11 +798,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
-	// Store message in database
+	// Store message in database with contact's full name for indexing
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
 		sender,
+		senderName,
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -463,9 +828,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 		// Log based on message type
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			logger.Debugf("[%s] %s %s: [%s: %s] %s", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			logger.Debugf("[%s] %s %s: %s", timestamp, direction, sender, content)
 		}
 	}
 }
@@ -610,7 +975,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
+	logger.Infof("Attempting to download media for message %s in chat %s...", messageID, chatJID)
 
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
@@ -640,7 +1005,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client — FIXED: added context.Background()
+	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
@@ -651,7 +1016,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
+	logger.Infof("Successfully downloaded %s media to %s (%d bytes)", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -703,11 +1068,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		logger.Debugf("Received request to send message: %s %s", req.Message, req.MediaPath)
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		logger.Debugf("Message sent: success=%v %s", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -774,25 +1139,139 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for searching messages
+	http.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse query parameters
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			http.Error(w, "Query parameter 'q' is required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID := r.URL.Query().Get("chat_jid")
+		limitStr := r.URL.Query().Get("limit")
+		offsetStr := r.URL.Query().Get("offset")
+
+		limit := 20 // default
+		if limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 100 {
+				limit = l
+			}
+		}
+
+		offset := 0 // default
+		if offsetStr != "" {
+			if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
+				offset = o
+			}
+		}
+
+		// Perform search
+		results, err := messageStore.SearchMessages(query, chatJID, limit, offset)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Search failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Send response
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"query":   query,
+			"results": results,
+			"total":   len(results),
+		})
+	})
+
+	// Handler for muting/unmuting chats
+	http.HandleFunc("/api/chats/", func(w http.ResponseWriter, r *http.Request) {
+		// Extract chat JID from path
+		path := strings.TrimPrefix(r.URL.Path, "/api/chats/")
+		if path == "" {
+			http.Error(w, "Chat JID required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID := strings.TrimSuffix(path, "/mute")
+		if chatJID == path {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			// Parse request body
+			var req struct {
+				Muted bool `json:"muted"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "Invalid request format", http.StatusBadRequest)
+				return
+			}
+
+			// Update mute status
+			err := messageStore.SetChatMuted(chatJID, req.Muted)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Failed to update mute status: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			// Set response headers
+			w.Header().Set("Content-Type", "application/json")
+
+			// Send response
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Chat %s muted status updated", chatJID),
+			})
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	logger.Infof("Starting REST API server on %s...", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
 		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+			logger.Errorf("REST API server error: %v", err)
 		}
 	}()
 }
 
 func main() {
 	// Set up logger
-	logger := waLog.Stdout("Client", "INFO", true)
+	logLevel := os.Getenv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "INFO"
+	}
+	if strings.ToUpper(logLevel) == "TRACE" {
+		traceEnabled = true
+		logLevel = "DEBUG"
+	}
+	logger = waLog.Stdout("Client", logLevel, true)
 	logger.Infof("Starting WhatsApp client...")
 
+	// Update WhatsApp version to latest
+	logger.Infof("Fetching latest WhatsApp version...")
+	latestVersion, err := whatsmeow.GetLatestVersion(context.Background(), nil)
+	if err != nil {
+		logger.Warnf("Failed to fetch latest WhatsApp version, using default: %v", err)
+	} else {
+		store.SetWAVersion(*latestVersion)
+		logger.Infof("Updated WhatsApp version to: %s", latestVersion.String())
+	}
+
 	// Create database connection for storing session data
-	dbLog := waLog.Stdout("Database", "INFO", true)
+	dbLog := waLog.Stdout("Database", logLevel, true)
 
 	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
@@ -800,7 +1279,6 @@ func main() {
 		return
 	}
 
-	// FIXED: added context.Background()
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
@@ -808,7 +1286,6 @@ func main() {
 	}
 
 	// Get device store - This contains session information
-	// FIXED: added context.Background()
 	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -826,6 +1303,8 @@ func main() {
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
+	} else {
+		client.ManualHistorySyncDownload = true // Ensure we get all contacts before messages
 	}
 
 	// Initialize message store
@@ -836,6 +1315,14 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Re-index existing messages
+	go func() {
+		err := messageStore.ReIndexAllMessages()
+		if err != nil {
+			logger.Errorf("Failed to re-index messages: %v", err)
+		}
+	}()
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -843,13 +1330,60 @@ func main() {
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
+		case *events.Contact:
+			tracef("Syncing Contacts!")
+
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
+			// STEP 1: Fetch contacts from critical_unblock_low app state
+			logger.Infof("Step 1: Syncing contacts...")
+			err := client.FetchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, true, false)
+			if err != nil {
+				logger.Infof("Error syncing contacts: %v", err)
+				return
+			}
+			logger.Infof("Contacts synced successfully ✓")
+			allContacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+			logger.Infof("Total contacts in store1: %d, error: %v", len(allContacts), err)
 
+			client.ManualHistorySyncDownload = false // Now we can allow history sync to process messages
+
+			// STEP 2: Fetch other critical app states
+			logger.Infof("Step 2: Syncing critical block...")
+			err = client.FetchAppState(context.Background(), appstate.WAPatchCriticalBlock, true, false)
+			if err != nil {
+				logger.Infof("Error syncing critical block: %v", err)
+				return
+			}
+			logger.Infof("Critical block synced ✓")
+			allContacts2, err := client.Store.Contacts.GetAllContacts(context.Background())
+			logger.Infof("Total contacts in store2: %d, error: %v", len(allContacts2), err)
+
+			// STEP 3: Sync other patches
+			logger.Infof("Step 3: Syncing regular patches...")
+			for _, patchName := range []appstate.WAPatchName{
+				appstate.WAPatchRegularLow,
+				appstate.WAPatchRegularHigh,
+				appstate.WAPatchRegular,
+			} {
+				err := client.FetchAppState(context.Background(), patchName, true, false)
+				if err != nil {
+					logger.Infof("Error syncing %s: %v", patchName, err)
+				} else {
+					logger.Infof("%s synced ✓", patchName)
+				}
+			}
+
+			// STEP 4: Now history sync is ready
+			logger.Infof("Step 4: Ready for history sync...")
+
+			allContacts3, err := client.Store.Contacts.GetAllContacts(context.Background())
+			logger.Infof("Total contacts in store3: %d, error: %v", len(allContacts3), err)
+
+			// History sync notifications will now be processed
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
 		}
@@ -871,7 +1405,7 @@ func main() {
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				logger.Infof("Scan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true
@@ -882,7 +1416,7 @@ func main() {
 		// Wait for connection
 		select {
 		case <-connected:
-			fmt.Println("\nSuccessfully connected and authenticated!")
+			logger.Infof("Successfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
 			logger.Errorf("Timeout waiting for QR code scan")
 			return
@@ -905,7 +1439,7 @@ func main() {
 		return
 	}
 
-	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
+	logger.Infof("Connected to WhatsApp!")
 
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
@@ -914,40 +1448,29 @@ func main() {
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	logger.Infof("REST server is running. Press Ctrl+C to disconnect and exit.")
 
 	// Wait for termination signal
 	<-exitChan
 
-	fmt.Println("Disconnecting...")
+	logger.Infof("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
-	var existingName string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
-		return existingName
-	}
-
-	// Need to determine chat name
+	// Always try to get the current name first, then check database as fallback
 	var name string
 
 	if jid.Server == "g.us" {
 		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
+		tracef("Getting name for group: %s", chatJID)
 
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
 			// Extract name from conversation if available
-			// This uses type assertions to handle different possible types
 			var displayName, convName *string
-			// Try to extract the fields we care about regardless of the exact type
 			v := reflect.ValueOf(conversation)
 			if v.Kind() == reflect.Ptr && !v.IsNil() {
 				v = v.Elem()
@@ -975,7 +1498,6 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			// FIXED: added context.Background()
 			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
@@ -985,25 +1507,37 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
+		tracef("Using group name: %s", name)
 	} else {
 		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
+		tracef("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		// FIXED: added context.Background()
+		// Just use contact info (full name) - try this first
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+			tracef("Found contact name: %s", name)
+		} else if contact.PushName != "" {
+			name = contact.PushName
+			tracef("Using push name: %s", name)
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
+			logger.Warnf("Using sender as fallback: %s", name)
 		} else {
 			// Last fallback to JID
 			name = jid.User
+			logger.Warnf("Using JID as last fallback: %s", name)
 		}
+	}
 
-		logger.Infof("Using contact name: %s", name)
+	// Update the database with the current name
+	if name != "" {
+		_, err := messageStore.db.Exec("INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+			chatJID, name, time.Now())
+		if err != nil {
+			logger.Warnf("Failed to update chat name in database: %v\n%s", err, debug.Stack())
+		}
 	}
 
 	return name
@@ -1011,7 +1545,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
-	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
+	logger.Infof("Received history sync event with %d conversations", len(historySync.Data.Conversations))
 
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
@@ -1077,7 +1611,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				tracef("Message content: %v, Media Type: %v", content, mediaType)
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -1116,10 +1650,38 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Determine sender's full name for indexing
+				var senderFullName string
+				if msg.Message.Key != nil && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+					// Try to get contact info for this participant
+					jid, err := types.ParseJID(*msg.Message.Key.Participant)
+					if err != nil {
+						logger.Warnf("Failed to parse JID: %v", err)
+						continue
+					}
+					contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+					if err == nil && contact.FullName != "" {
+						senderFullName = contact.FullName
+					} else if contact.PushName != "" {
+						senderFullName = contact.PushName
+					} else if sender != "" {
+						// Fallback to sender
+						senderFullName = sender
+					} else {
+						// Last fallback to JID
+						senderFullName = *msg.Message.Key.Participant
+					}
+				} else if isFromMe {
+					senderFullName = "You"
+				} else {
+					senderFullName = sender
+				}
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
 					sender,
+					senderFullName,
 					content,
 					timestamp,
 					isFromMe,
@@ -1137,10 +1699,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					syncedCount++
 					// Log successful message storage
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
+						tracef("Stored message: [%s] %s -> %s: [%s: %s] %s",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
 					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
+						tracef("Stored message: [%s] %s -> %s: %s",
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
@@ -1148,30 +1710,30 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		}
 	}
 
-	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
+	logger.Infof("History sync complete. Stored %d messages.", syncedCount)
 }
 
 // Request history sync from the server
 func requestHistorySync(client *whatsmeow.Client) {
 	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
+		logger.Errorf("Client is not initialized. Cannot request history sync.")
 		return
 	}
 
 	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
+		logger.Errorf("Client is not connected. Please ensure you are connected to WhatsApp first.")
 		return
 	}
 
 	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
+		logger.Errorf("Client is not logged in. Please scan the QR code first.")
 		return
 	}
 
 	// Build and send a history sync request
 	historyMsg := client.BuildHistorySyncRequest(nil, 100)
 	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
+		logger.Errorf("Failed to build history sync request.")
 		return
 	}
 
@@ -1181,9 +1743,9 @@ func requestHistorySync(client *whatsmeow.Client) {
 	}, historyMsg)
 
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
+		logger.Errorf("Failed to request history sync: %v", err)
 	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		logger.Infof("History sync requested. Waiting for server response...")
 	}
 }
 
@@ -1246,7 +1808,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 					preSkip = binary.LittleEndian.Uint16(pageData[headPos+10 : headPos+12])
 					sampleRate = binary.LittleEndian.Uint32(pageData[headPos+12 : headPos+16])
 					foundOpusHead = true
-					fmt.Printf("Found OpusHead: sampleRate=%d, preSkip=%d\n", sampleRate, preSkip)
+					logger.Debugf("Found OpusHead: sampleRate=%d, preSkip=%d", sampleRate, preSkip)
 				}
 			}
 		}
@@ -1261,7 +1823,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	}
 
 	if !foundOpusHead {
-		fmt.Println("Warning: OpusHead not found, using default values")
+		logger.Warnf("OpusHead not found, using default values")
 	}
 
 	// Calculate duration based on granule position
@@ -1269,11 +1831,10 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 		// Formula for duration: (lastGranule - preSkip) / sampleRate
 		durationSeconds := float64(lastGranule-uint64(preSkip)) / float64(sampleRate)
 		duration = uint32(math.Ceil(durationSeconds))
-		fmt.Printf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)\n",
-			durationSeconds, lastGranule)
+		logger.Debugf("Calculated Opus duration from granule: %f seconds (lastGranule=%d)", durationSeconds, lastGranule)
 	} else {
 		// Fallback to rough estimation if granule position not found
-		fmt.Println("Warning: No valid granule position found, using estimation")
+		logger.Warnf("No valid granule position found, using estimation")
 		durationEstimate := float64(len(data)) / 2000.0 // Very rough approximation
 		duration = uint32(durationEstimate)
 	}
@@ -1288,8 +1849,7 @@ func analyzeOggOpus(data []byte) (duration uint32, waveform []byte, err error) {
 	// Generate waveform
 	waveform = placeholderWaveform(duration)
 
-	fmt.Printf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes\n",
-		len(data), duration, len(waveform))
+	logger.Debugf("Ogg Opus analysis: size=%d bytes, calculated duration=%d sec, waveform=%d bytes", len(data), duration, len(waveform))
 
 	return duration, waveform, nil
 }
