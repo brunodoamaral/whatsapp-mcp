@@ -340,10 +340,13 @@ func (store *MessageStore) ReIndexAllMessages() error {
 		}
 		rows.Close()
 
+		logger.Debugf("Batch reindex messages from %d to %d", count, count+batchSize)
+
 		if count < batchSize {
 			break
 		}
 		offset += batchSize
+
 	}
 
 	logger.Infof("Re-indexed %d messages", indexed)
