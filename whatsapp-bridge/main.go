@@ -37,6 +37,10 @@ import (
 	"github.com/blevesearch/bleve/v2"
 )
 
+// searchEnabled indicates whether vector/hybrid search is available.
+// Set during NewMessageStore based on whether the embedder initialises successfully.
+var searchEnabled bool
+
 // package-level logger, initialized in main()
 var logger waLog.Logger
 var traceEnabled bool
@@ -59,41 +63,26 @@ type Message struct {
 	Filename  string
 }
 
-// MessageDocument represents a message for bleve indexing
-type MessageDocument struct {
-	ID        string    `json:"id"`
-	ChatJID   string    `json:"chat_jid"`
-	Sender    string    `json:"sender"`
-	FullName  string    `json:"full_name"`
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp"`
-	IsFromMe  bool      `json:"is_from_me"`
-	MediaType string    `json:"media_type"`
-	Filename  string    `json:"filename"`
-	Score     float64   `json:"score,omitempty"`
-}
-
-// Database handler for storing message history
+// MessageStore handles message persistence (SQLite) and search (bleve + embeddings).
 type MessageStore struct {
-	db    *sql.DB
-	index bleve.Index
+	db       *sql.DB
+	index    bleve.Index
+	embedder *Embedder
 }
 
-// Initialize message store
+// NewMessageStore initialises the SQLite database, the bleve index (with vector
+// support when available), and the ONNX embedding model.
 func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
 	if err := os.MkdirAll("store", 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
 	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 	db.SetMaxOpenConns(1)
 
-	// Create tables if they don't exist
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
@@ -101,7 +90,7 @@ func NewMessageStore() (*MessageStore, error) {
 			last_message_time TIMESTAMP,
 			muted BOOLEAN DEFAULT FALSE
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -126,34 +115,41 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	// Initialize bleve index
-	indexPath := "store/messages.bleve"
-	index, err := bleve.Open(indexPath)
-	if err == bleve.ErrorIndexPathDoesNotExist {
-		// Create new index
-		mapping := bleve.NewIndexMapping()
-		// Configure text field mapping for content
-		textFieldMapping := bleve.NewTextFieldMapping()
-		textFieldMapping.Analyzer = "en"
-		mapping.DefaultMapping.AddFieldMappingsAt("content", textFieldMapping)
-		mapping.DefaultMapping.AddFieldMappingsAt("sender", textFieldMapping)
-		mapping.DefaultMapping.AddFieldMappingsAt("filename", textFieldMapping)
-
-		index, err = bleve.New(indexPath, mapping)
-		if err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to create bleve index: %v", err)
-		}
-	} else if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to open bleve index: %v", err)
+	// Initialise embedder (best-effort — search still works text-only without it).
+	logger.Infof("Initialising embedding model...")
+	embedder, err := NewEmbedder(defaultEmbeddingModelID, defaultEmbeddingOnnxFile)
+	if err != nil {
+		logger.Warnf("Embedding model unavailable, falling back to text-only search: %v", err)
+		embedder = nil
+	} else {
+		searchEnabled = true
+		logger.Infof("Embedding model ready (dim=%d)", embedder.EmbDim())
 	}
 
-	return &MessageStore{db: db, index: index}, nil
+	// If we have an embedder, we need a vector-capable index. If the existing
+	// index was created without vector fields, delete and recreate it.
+	embDim := 0
+	if embedder != nil {
+		embDim = embedder.EmbDim()
+	}
+
+	index, err := openOrCreateIndex(embDim)
+	if err != nil {
+		if embedder != nil {
+			embedder.Close()
+		}
+		db.Close()
+		return nil, err
+	}
+
+	return &MessageStore{db: db, index: index, embedder: embedder}, nil
 }
 
-// Close the database connection
+// Close releases all resources.
 func (store *MessageStore) Close() error {
+	if store.embedder != nil {
+		store.embedder.Close()
+	}
 	if store.index != nil {
 		store.index.Close()
 	}
@@ -195,24 +191,8 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 		return err
 	}
 
-	// Index message in bleve
-	docID := chatJID + ":" + id
-	doc := MessageDocument{
-		ID:        id,
-		ChatJID:   chatJID,
-		Sender:    sender,
-		FullName:  fullName,
-		Content:   content,
-		Timestamp: timestamp,
-		IsFromMe:  isFromMe,
-		MediaType: mediaType,
-		Filename:  filename,
-	}
-	err = store.index.Index(docID, doc)
-	if err != nil {
-		// Log error but don't fail the operation
-		logger.Warnf("Failed to index message %s: %v", docID, err)
-	}
+	// Index message in bleve (with embedding if available).
+	indexMessage(store.index, store.embedder, id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename)
 
 	return nil
 }
@@ -285,72 +265,9 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Re-index all messages from database to bleve
+// ReIndexAllMessages delegates to the search module.
 func (store *MessageStore) ReIndexAllMessages() error {
-	logger.Infof("Starting re-indexing of all messages...")
-
-	const batchSize = 500
-	offset := 0
-	indexed := 0
-
-	for {
-		rows, err := store.db.Query(`
-			SELECT id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename
-			FROM messages
-			WHERE content != '' OR media_type != ''
-			ORDER BY rowid
-			LIMIT ? OFFSET ?
-		`, batchSize, offset)
-		if err != nil {
-			return fmt.Errorf("failed to query messages: %v", err)
-		}
-
-		count := 0
-		for rows.Next() {
-			var id, chatJID, sender, fullName, content, mediaType, filename string
-			var timestamp time.Time
-			var isFromMe bool
-
-			err := rows.Scan(&id, &chatJID, &sender, &fullName, &content, &timestamp, &isFromMe, &mediaType, &filename)
-			if err != nil {
-				logger.Warnf("Error scanning message: %v", err)
-				continue
-			}
-
-			docID := chatJID + ":" + id
-			doc := MessageDocument{
-				ID:        id,
-				ChatJID:   chatJID,
-				Sender:    sender,
-				FullName:  fullName,
-				Content:   content,
-				Timestamp: timestamp,
-				IsFromMe:  isFromMe,
-				MediaType: mediaType,
-				Filename:  filename,
-			}
-
-			err = store.index.Index(docID, doc)
-			if err != nil {
-				logger.Warnf("Failed to index message %s: %v", docID, err)
-			} else {
-				indexed++
-			}
-			count++
-		}
-		rows.Close()
-
-		logger.Debugf("Batch reindex messages from %d to %d", count, count+batchSize)
-
-		if count < batchSize {
-			break
-		}
-		offset += batchSize
-
-	}
-
-	logger.Infof("Re-indexed %d messages", indexed)
-	return nil
+	return reIndexAllMessages(store)
 }
 
 // Get mute status for a chat
@@ -369,152 +286,27 @@ func (store *MessageStore) SetChatMuted(chatJID string, muted bool) error {
 	return err
 }
 
-// calculateUserMessageRatio calculates the ratio of user's messages in a chat
+// calculateUserMessageRatio calculates the ratio of user's messages in a chat.
 func (store *MessageStore) calculateUserMessageRatio(chatJID string) (float64, error) {
 	var totalMessages, userMessages int
 	err := store.db.QueryRow(`
-		SELECT COUNT(*) as total, 
+		SELECT COUNT(*) as total,
 		       SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) as user
-		FROM messages 
+		FROM messages
 		WHERE chat_jid = ?
 	`, chatJID).Scan(&totalMessages, &userMessages)
-
 	if err != nil {
 		return 0, err
 	}
-
 	if totalMessages == 0 {
 		return 0, nil
 	}
-
 	return float64(userMessages) / float64(totalMessages), nil
 }
 
-// CustomRescorer implements custom scoring for search results
-type CustomRescorer struct {
-	store *MessageStore
-}
-
-// Rescore applies custom scoring logic
-func (r *CustomRescorer) Rescore(ctx context.Context, searchResult *bleve.SearchResult) error {
-	// Cache for chat ratios to avoid repeated DB queries
-	chatRatios := make(map[string]float64)
-
-	for _, hit := range searchResult.Hits {
-		// Extract chat_jid from document ID (format: chat_jid:message_id)
-		parts := strings.SplitN(hit.ID, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		chatJID := parts[0]
-
-		// Check if chat is muted
-		muted, err := r.store.IsChatMuted(chatJID)
-		if err == nil && muted {
-			// Penalize muted chats
-			hit.Score *= 0.1
-		}
-
-		// Get or calculate user message ratio for this chat
-		ratio, exists := chatRatios[chatJID]
-		if !exists {
-			ratio, err = r.calculateUserMessageRatio(chatJID)
-			if err != nil {
-				ratio = 0.5 // Default fallback
-			}
-			chatRatios[chatJID] = ratio
-		}
-
-		// Boost by ratio (higher ratio = higher boost)
-		hit.Score *= (1.0 + ratio)
-	}
-
-	return nil
-}
-
-// calculateUserMessageRatio calculates the ratio of user's messages in a chat
-func (r *CustomRescorer) calculateUserMessageRatio(chatJID string) (float64, error) {
-	var totalMessages, userMessages int
-	err := r.store.db.QueryRow(`
-		SELECT COUNT(*) as total, 
-		       SUM(CASE WHEN is_from_me = 1 THEN 1 ELSE 0 END) as user
-		FROM messages 
-		WHERE chat_jid = ?
-	`, chatJID).Scan(&totalMessages, &userMessages)
-
-	if err != nil {
-		return 0, err
-	}
-
-	if totalMessages == 0 {
-		return 0, nil
-	}
-
-	return float64(userMessages) / float64(totalMessages), nil
-}
-
-// Search messages using bleve with custom scoring
+// SearchMessages delegates to the search module.
 func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, offset int) ([]Message, error) {
-	var searchRequest *bleve.SearchRequest
-
-	if chatJID != "" {
-		chatTermQuery := bleve.NewTermQuery(chatJID)
-		chatTermQuery.SetField("chat_jid")
-		booleanQuery := bleve.NewBooleanQuery()
-		booleanQuery.AddMust(bleve.NewMatchQuery(queryStr))
-		booleanQuery.AddMust(chatTermQuery)
-		searchRequest = bleve.NewSearchRequest(booleanQuery)
-	} else {
-		searchRequest = bleve.NewSearchRequest(bleve.NewMatchQuery(queryStr))
-	}
-
-	searchRequest.Size = limit
-	searchRequest.From = offset
-	searchRequest.SortBy([]string{"-_score", "-timestamp"})
-
-	// Execute search
-	searchResult, err := store.index.Search(searchRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	// Convert results to MessageDocument and apply custom scoring
-	var results []Message
-	chatRatios := make(map[string]float64)
-
-	for _, hit := range searchResult.Hits {
-		// Decompose hit.ID (docID) := chatJID + ":" + id
-		idParts := strings.Split(hit.ID, ":")
-		chatJID := idParts[0]
-		messageID := idParts[1]
-		doc, err := store.GetMessage(messageID, chatJID)
-		if err != nil {
-			continue
-		}
-
-		// Apply custom scoring
-		muted, err := store.IsChatMuted(chatJID)
-		if err == nil && muted {
-			hit.Score *= 0.1
-		}
-
-		// Get or calculate user message ratio
-		ratio, exists := chatRatios[chatJID]
-		if !exists {
-			ratio, err = store.calculateUserMessageRatio(chatJID)
-			if err != nil {
-				ratio = 0.5
-			}
-			chatRatios[chatJID] = ratio
-		}
-
-		hit.Score *= (1.0 + ratio)
-		// doc.Score = hit.Score
-
-		results = append(results, *doc)
-	}
-
-	return results, nil
+	return searchMessages(store, queryStr, chatJID, limit, offset)
 }
 
 // Extract text content from a message
