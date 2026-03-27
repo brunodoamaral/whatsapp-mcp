@@ -29,10 +29,11 @@ type MessageDocument struct {
 
 // contextMsg is a lightweight message used for building conversation context windows.
 type contextMsg struct {
-	Sender    string
-	FullName  string
-	Content   string
-	Timestamp time.Time
+	Sender         string
+	FullName       string
+	Content        string
+	ReplyToContent string
+	Timestamp      time.Time
 }
 
 // SearchResult groups search hits by conversation context window.
@@ -64,6 +65,16 @@ func formatContextWindow(msgs []contextMsg) string {
 		b.WriteString("[")
 		b.WriteString(name)
 		b.WriteString("]: ")
+		if m.ReplyToContent != "" {
+			b.WriteString("> ")
+			// Replace \n in the replied-to content with spaces to keep it one line, and truncate to 100 chars for context.
+			replyFormated := strings.ReplaceAll(m.ReplyToContent, "\n", " ")
+			if len(replyFormated) > 100 {
+				replyFormated = replyFormated[:100] + "..."
+			}
+			b.WriteString(replyFormated) // include a snippet of the replied-to message for context
+			b.WriteString("\n")
+		}
 		b.WriteString(m.Content)
 	}
 	return b.String()
@@ -131,10 +142,12 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 		groupSize := messageJIDOrder - groupStart + 1
 
 		// Fetch all messages in the current group from SQLite.
-		groupRows, err := db.Query(
-			`SELECT sender, full_name, content, timestamp FROM messages
-			 WHERE chat_jid = ? AND (content != '' OR media_type != '')
-			 ORDER BY timestamp LIMIT ? OFFSET ?`,
+		groupRows, err := db.Query(`
+			SELECT m.sender, m.full_name, m.content, m.timestamp, r.content
+			FROM messages m
+			LEFT JOIN messages r ON m.reply_to_id = r.id
+			WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
+			ORDER BY m.timestamp LIMIT ? OFFSET ?`,
 			chatJID, groupSize, groupStart,
 		)
 		if err != nil {
@@ -142,7 +155,7 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 		} else {
 			for groupRows.Next() {
 				var m contextMsg
-				if scanErr := groupRows.Scan(&m.Sender, &m.FullName, &m.Content, &m.Timestamp); scanErr == nil {
+				if scanErr := groupRows.Scan(&m.Sender, &m.FullName, &m.Content, &m.Timestamp, &m.ReplyToContent); scanErr == nil {
 					groupMsgs = append(groupMsgs, m)
 				}
 			}
@@ -193,7 +206,7 @@ type reindexRow struct {
 }
 
 const (
-	// embBatch is defined in embedding.go
+// embBatch is defined in embedding.go
 )
 
 // reIndexAllMessages re-indexes every message from the database into bleve
@@ -300,10 +313,11 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 
 		// Load all messages for this chat.
 		msgRows, err := store.db.Query(`
-			SELECT id, sender, full_name, content, timestamp, is_from_me, media_type, filename
-			FROM messages
-			WHERE chat_jid = ? AND (content != '' OR media_type != '')
-			ORDER BY timestamp
+			SELECT m.id, m.sender, m.full_name, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
+			FROM messages m
+			LEFT JOIN messages r ON m.reply_to_id = r.id
+			WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
+			ORDER BY m.timestamp
 		`, jid)
 		if err != nil {
 			logger.Warnf("Failed to query messages for %s: %v", jid, err)
@@ -311,16 +325,16 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 		}
 
 		type rawMsg struct {
-			id, sender, fullName, content string
-			timestamp                     time.Time
-			isFromMe                      bool
-			mediaType, filename           string
+			id, sender, fullName, content, replyToContent string
+			timestamp                                     time.Time
+			isFromMe                                      bool
+			mediaType, filename                           string
 		}
 		var msgs []rawMsg
 		for msgRows.Next() {
 			var m rawMsg
 			if err := msgRows.Scan(&m.id, &m.sender, &m.fullName, &m.content,
-				&m.timestamp, &m.isFromMe, &m.mediaType, &m.filename); err != nil {
+				&m.timestamp, &m.isFromMe, &m.mediaType, &m.filename, &m.replyToContent); err != nil {
 				logger.Warnf("Error scanning message for %s: %v", jid, err)
 				continue
 			}
@@ -348,10 +362,11 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 			ctxMsgs := make([]contextMsg, len(chunk))
 			for k, m := range chunk {
 				ctxMsgs[k] = contextMsg{
-					Sender:    m.sender,
-					FullName:  m.fullName,
-					Content:   m.content,
-					Timestamp: m.timestamp,
+					Sender:         m.sender,
+					FullName:       m.fullName,
+					Content:        m.content,
+					Timestamp:      m.timestamp,
+					ReplyToContent: m.replyToContent,
 				}
 			}
 			ctxStr := formatContextWindow(ctxMsgs)
