@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -424,27 +425,33 @@ type rescoredHit struct {
 // searchMessages performs a hybrid text + vector search using bleve's score
 // fusion, then applies custom rescoring (mute penalty, user-ratio boost) and
 // returns one SearchResult per matched context group.
-func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, offset int) ([]SearchResult, error) {
-	logger.Debugf("Searching for \"%s\" (chatJID=%s, limit=%d, offset=%d)", queryStr, chatJID, limit, offset)
+func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, semanticWeight float64) ([]SearchResult, error) {
+	logger.Debugf("Searching for \"%s\" (chatJID=%s, limit=%d, offset=%d)", queryStr, chatJID, limit)
+
+	// Main query
+	matchQuery := bleve.NewMatchQuery(queryStr)
+	matchQuery.SetBoost(1.0 - semanticWeight)
 
 	// Build text query.
 	var textQuery query.Query
+	var fetchSize int
 	if chatJID != "" {
 		chatTermQuery := bleve.NewTermQuery(chatJID)
 		chatTermQuery.SetField("chat_jid")
 		booleanQuery := bleve.NewBooleanQuery()
-		booleanQuery.AddMust(bleve.NewMatchQuery(queryStr))
+		booleanQuery.AddMust(matchQuery)
 		booleanQuery.AddMust(chatTermQuery)
 		textQuery = booleanQuery
+		fetchSize = limit
 	} else {
-		textQuery = bleve.NewMatchQuery(queryStr)
+		textQuery = matchQuery
+		fetchSize = limit * 5 // Increase fecth size for open search to compensate for deduplication and filtering
 	}
 
 	// Over-fetch to compensate for deduplication.
-	fetchSize := limit * 3
 	searchRequest := bleve.NewSearchRequest(textQuery)
 	searchRequest.Size = fetchSize
-	searchRequest.From = offset
+	searchRequest.From = 0
 	searchRequest.SortBy([]string{"-_score", "-timestamp_last"})
 
 	// Add kNN vector query if embedder is available.
@@ -454,8 +461,8 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 			if err != nil {
 				logger.Warnf("Failed to embed search query, falling back to text-only: %v", err)
 			} else {
-				searchRequest.AddKNN("embedding", queryVec, int64(fetchSize)*10, 0.5)
-				searchRequest.Score = "rrf"
+				searchRequest.AddKNN("embedding", queryVec, int64(fetchSize), semanticWeight)
+				searchRequest.Score = bleve.ScoreRSF
 			}
 		}
 	} else {
@@ -463,7 +470,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 	}
 
 	params := bleve.RequestParams{
-		ScoreWindowSize: 150,
+		ScoreWindowSize: fetchSize,
 	}
 	searchRequest.AddParams(params)
 
@@ -518,6 +525,14 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 			score:   hit.Score,
 		})
 	}
+
+	// Sort hits by rescored value and timestamp (descending).
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].score == hits[j].score {
+			return hits[i].chatJID > hits[j].chatJID // tie-breaker: newer chats first
+		}
+		return hits[i].score > hits[j].score
+	})
 
 	// Build SearchResults: one per hit, fetching group messages directly from SQLite.
 	var results []SearchResult

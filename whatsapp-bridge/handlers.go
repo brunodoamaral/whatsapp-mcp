@@ -113,7 +113,7 @@ func makeSearchHandler(messageStore *MessageStore) http.HandlerFunc {
 
 		chatJID := r.URL.Query().Get("chat_jid")
 		limitStr := r.URL.Query().Get("limit")
-		offsetStr := r.URL.Query().Get("offset")
+		semanticWeightStr := r.URL.Query().Get("semantic_weight")
 
 		limit := 20 // default
 		if limitStr != "" {
@@ -122,14 +122,14 @@ func makeSearchHandler(messageStore *MessageStore) http.HandlerFunc {
 			}
 		}
 
-		offset := 0 // default
-		if offsetStr != "" {
-			if o, err := strconv.Atoi(offsetStr); err == nil && o >= 0 {
-				offset = o
+		semanticWeight := 0.5 // default
+		if semanticWeightStr != "" {
+			if w, err := strconv.ParseFloat(semanticWeightStr, 64); err == nil && w >= 0 && w <= 1 {
+				semanticWeight = w
 			}
 		}
 
-		results, err := messageStore.SearchMessages(query, chatJID, limit, offset)
+		results, err := messageStore.SearchMessages(query, chatJID, limit, semanticWeight)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Search failed: %v", err), http.StatusInternalServerError)
 			return

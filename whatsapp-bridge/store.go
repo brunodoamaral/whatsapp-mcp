@@ -296,8 +296,8 @@ func (store *MessageStore) calculateUserMessageRatio(chatJID string) (float64, e
 }
 
 // SearchMessages delegates to the search module.
-func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, offset int) ([]SearchResult, error) {
-	return searchMessages(store, queryStr, chatJID, limit, offset)
+func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, semanticWeight float64) ([]SearchResult, error) {
+	return searchMessages(store, queryStr, chatJID, limit, semanticWeight)
 }
 
 // Store additional media info in the database
