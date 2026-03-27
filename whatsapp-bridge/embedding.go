@@ -35,7 +35,7 @@ const (
 
 // seqLenBuckets defines the allowed sequence lengths for cached sessions.
 // padLen is rounded up to the first bucket that fits.
-var seqLenBuckets = []int{8, 16, 24, 32, 48, 64}
+var seqLenBuckets = []int{16, 32, 48, 56, 64, 72, 80, 96, 128}
 
 // embeddingModelConfig holds relevant fields from config.json at the repo root.
 type embeddingModelConfig struct {
@@ -295,8 +295,8 @@ func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
 	for i, text := range texts {
 		rawIDs := e.tok.Encode(text)
 		maxLen := e.maxSeqLen
-		if maxLen > 64 {
-			maxLen = 64
+		if maxLen > 128 {
+			maxLen = 128
 		}
 		if len(rawIDs) > maxLen {
 			rawIDs = rawIDs[:maxLen]

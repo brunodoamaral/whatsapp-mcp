@@ -111,6 +111,8 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages(chat_jid, timestamp);
 	`)
 	if err != nil {
 		db.Close()
@@ -194,7 +196,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 	}
 
 	// Index message in bleve (with embedding if available).
-	indexMessage(store.index, store.embedder, id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename)
+	indexMessage(store.index, store.embedder, store.db, id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename)
 
 	return nil
 }
@@ -272,6 +274,16 @@ func (store *MessageStore) ReIndexAllMessages(maxRows int) error {
 	return reIndexAllMessages(store, maxRows)
 }
 
+// GetChatNameByJID returns the stored name for a chat, or "" if not found.
+func (store *MessageStore) GetChatNameByJID(chatJID string) string {
+	var name sql.NullString
+	err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&name)
+	if err != nil || !name.Valid {
+		return ""
+	}
+	return name.String
+}
+
 // Get mute status for a chat
 func (store *MessageStore) IsChatMuted(chatJID string) (bool, error) {
 	var muted bool
@@ -307,7 +319,7 @@ func (store *MessageStore) calculateUserMessageRatio(chatJID string) (float64, e
 }
 
 // SearchMessages delegates to the search module.
-func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, offset int) ([]Message, error) {
+func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, offset int) ([]SearchResult, error) {
 	return searchMessages(store, queryStr, chatJID, limit, offset)
 }
 

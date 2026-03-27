@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +24,7 @@ type MessageDocument struct {
 	Sender    string    `json:"sender"`
 	FullName  string    `json:"full_name"`
 	Content   string    `json:"content"`
+	Context   string    `json:"context"`
 	Timestamp time.Time `json:"timestamp"`
 	IsFromMe  bool      `json:"is_from_me"`
 	MediaType string    `json:"media_type"`
@@ -29,7 +33,125 @@ type MessageDocument struct {
 	Score     float64   `json:"score,omitempty"`
 }
 
+// contextMsg is a lightweight message used for building conversation context windows.
+type contextMsg struct {
+	Sender    string
+	FullName  string
+	Content   string
+	Timestamp time.Time
+}
+
+// SearchResult groups search hits by conversation context window.
+type SearchResult struct {
+	ChatJID  string    `json:"chat_jid"`
+	ChatName string    `json:"chat_name"`
+	Score    float64   `json:"score"`
+	Messages []Message `json:"messages"`
+}
+
 const indexPath = "store/messages.bleve"
+
+const (
+	contextWindowDuration = 5 * time.Minute
+	contextMinMsgs        = 8
+	contextMaxMsgs        = 32
+)
+
+// getContextWindow fetches messages from the same chat within a time-based window
+// around the target timestamp. Returns up to contextMaxMsgs, with a fallback to
+// the nearest contextMinMsgs if the time window yields too few.
+func getContextWindow(db *sql.DB, chatJID string, targetTimestamp time.Time) ([]contextMsg, error) {
+	tStart := targetTimestamp.Add(-contextWindowDuration)
+	tEnd := targetTimestamp.Add(contextWindowDuration)
+
+	rows, err := db.Query(`
+		SELECT sender, full_name, content, timestamp FROM messages
+		WHERE chat_jid = ? AND timestamp BETWEEN ? AND ?
+		  AND (content != '' OR media_type != '')
+		ORDER BY timestamp ASC LIMIT ?
+	`, chatJID, tStart, tEnd, contextMaxMsgs)
+	if err != nil {
+		return nil, fmt.Errorf("context window query: %w", err)
+	}
+	defer rows.Close()
+
+	var msgs []contextMsg
+	for rows.Next() {
+		var m contextMsg
+		if err := rows.Scan(&m.Sender, &m.FullName, &m.Content, &m.Timestamp); err != nil {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+
+	if len(msgs) >= contextMinMsgs {
+		return msgs, nil
+	}
+
+	// Fallback: get nearest messages by time distance.
+	targetUnix := targetTimestamp.Unix()
+	rows2, err := db.Query(`
+		SELECT sender, full_name, content, timestamp FROM messages
+		WHERE chat_jid = ? AND (content != '' OR media_type != '')
+		ORDER BY ABS(CAST(strftime('%s', timestamp) AS INTEGER) - ?) ASC
+		LIMIT ?
+	`, chatJID, targetUnix, contextMinMsgs)
+	if err != nil {
+		// Return what we have from the first query.
+		if len(msgs) > 0 {
+			return msgs, nil
+		}
+		return nil, fmt.Errorf("context window fallback query: %w", err)
+	}
+	defer rows2.Close()
+
+	msgs = msgs[:0]
+	for rows2.Next() {
+		var m contextMsg
+		if err := rows2.Scan(&m.Sender, &m.FullName, &m.Content, &m.Timestamp); err != nil {
+			continue
+		}
+		msgs = append(msgs, m)
+	}
+
+	// Re-sort by timestamp since the fallback query orders by distance.
+	sort.Slice(msgs, func(i, j int) bool {
+		return msgs[i].Timestamp.Before(msgs[j].Timestamp)
+	})
+
+	return msgs, nil
+}
+
+// formatContextWindow builds a context string from a slice of messages.
+func formatContextWindow(msgs []contextMsg) string {
+	var b strings.Builder
+	for i, m := range msgs {
+		if m.Content == "" {
+			continue
+		}
+		name := m.FullName
+		if name == "" {
+			name = m.Sender
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString("[")
+		b.WriteString(name)
+		b.WriteString("]: ")
+		b.WriteString(m.Content)
+	}
+	return b.String()
+}
+
+// buildContextFromSliding builds a context string from a sliding window of
+// preceding messages plus the current message. Used by reindexAllMessages.
+func buildContextFromSliding(preceding []contextMsg, current contextMsg) string {
+	msgs := make([]contextMsg, 0, len(preceding)+1)
+	msgs = append(msgs, preceding...)
+	msgs = append(msgs, current)
+	return formatContextWindow(msgs)
+}
 
 // openOrCreateIndex opens the bleve index at indexPath, or creates a new one
 // with hybrid (text + vector) field mappings.
@@ -60,6 +182,7 @@ func buildIndexMapping(embDim int) mapping.IndexMapping {
 
 
 	m.DefaultMapping.AddFieldMappingsAt("content", textFieldMapping)
+	m.DefaultMapping.AddFieldMappingsAt("context", textFieldMapping)
 	m.DefaultMapping.AddFieldMappingsAt("sender", textFieldMapping)
 	m.DefaultMapping.AddFieldMappingsAt("filename", textFieldMapping)
 
@@ -73,8 +196,8 @@ func buildIndexMapping(embDim int) mapping.IndexMapping {
 }
 
 // indexMessage indexes a single message document into bleve, generating an
-// embedding if the embedder is available and the message has text content.
-func indexMessage(index bleve.Index, embedder *Embedder, id, chatJID, sender, fullName, content string, timestamp time.Time, isFromMe bool, mediaType, filename string) {
+// embedding from the conversation context window if available.
+func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID, sender, fullName, content string, timestamp time.Time, isFromMe bool, mediaType, filename string) {
 	docID := chatJID + ":" + id
 	doc := MessageDocument{
 		ID:        id,
@@ -88,8 +211,21 @@ func indexMessage(index bleve.Index, embedder *Embedder, id, chatJID, sender, fu
 		Filename:  filename,
 	}
 
+	// Build context window for richer embedding and text search.
+	embText := content
+	if db != nil {
+		ctxMsgs, err := getContextWindow(db, chatJID, timestamp)
+		if err != nil {
+			logger.Warnf("Failed to get context window for %s: %v", docID, err)
+		} else if len(ctxMsgs) > 0 {
+			ctxStr := formatContextWindow(ctxMsgs)
+			doc.Context = ctxStr
+			embText = ctxStr
+		}
+	}
+
 	if embedder != nil {
-		if text := sanitizeForEmbedding(content); text != "" {
+		if text := sanitizeForEmbedding(embText); text != "" {
 			vec, err := embedder.Embed(text)
 			if err != nil {
 				logger.Warnf("Failed to embed message %s: %v", docID, err)
@@ -117,7 +253,8 @@ const (
 
 // reIndexAllMessages re-indexes every message from the database into bleve
 // using batch ONNX inference (embBatch texts per call) and bleve batch inserts
-// (one commit per DB page).
+// (one commit per DB page). Messages are ordered by chat_jid, timestamp so a
+// sliding context window can be built efficiently per conversation.
 func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	logger.Infof("Starting re-indexing of all messages...")
 
@@ -143,6 +280,9 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	lastReport := startTime
 	lastReportIdx := 0
 
+	// Sliding context window per chat, persists across pages.
+	chatContexts := make(map[string][]contextMsg)
+
 	for {
 		pageSize := dbPageSize
 		if maxRows > 0 && indexed+pageSize > maxRows {
@@ -153,7 +293,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 			SELECT id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename
 			FROM messages
 			WHERE content != '' OR media_type != ''
-			ORDER BY rowid
+			ORDER BY chat_jid, timestamp
 			LIMIT ? OFFSET ?
 		`, pageSize, offset)
 		if err != nil {
@@ -170,7 +310,6 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 				logger.Warnf("Error scanning message: %v", err)
 				continue
 			}
-			r.text = sanitizeForEmbedding(r.doc.Content)
 			page = append(page, r)
 		}
 		rows.Close()
@@ -179,8 +318,42 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 			break
 		}
 
+		// --- Build context windows and prepare embedding text ---
+		for i := range page {
+			chatJID := page[i].doc.ChatJID
+			preceding := chatContexts[chatJID]
+
+			current := contextMsg{
+				Sender:    page[i].doc.Sender,
+				FullName:  page[i].doc.FullName,
+				Content:   page[i].doc.Content,
+				Timestamp: page[i].doc.Timestamp,
+			}
+
+			// Filter preceding by time window: only keep messages within contextWindowDuration.
+			filtered := preceding
+			if len(filtered) > 0 {
+				cutoff := current.Timestamp.Add(-contextWindowDuration)
+				start := 0
+				for start < len(filtered) && filtered[start].Timestamp.Before(cutoff) {
+					start++
+				}
+				filtered = filtered[start:]
+			}
+
+			ctxStr := buildContextFromSliding(filtered, current)
+			page[i].doc.Context = ctxStr
+			page[i].text = sanitizeForEmbedding(ctxStr)
+
+			// Update sliding window for this chat.
+			updated := append(preceding, current)
+			if len(updated) > contextMaxMsgs {
+				updated = updated[len(updated)-contextMaxMsgs:]
+			}
+			chatContexts[chatJID] = updated
+		}
+
 		// --- Batch embedding ---
-		// Collect indices of rows that have embeddable text.
 		if store.embedder != nil {
 			embIdxs := make([]int, 0, embBatch)
 			embTexts := make([]string, 0, embBatch)
@@ -259,10 +432,19 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	return nil
 }
 
+// rescoredHit holds a bleve hit after rescoring, with parsed fields.
+type rescoredHit struct {
+	chatJID   string
+	timestamp time.Time
+	score     float64
+}
+
 // searchMessages performs a hybrid text + vector search using bleve's score
-// fusion, then applies custom rescoring (mute penalty, user-ratio boost).
-func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, offset int) ([]Message, error) {
+// fusion, then applies custom rescoring (mute penalty, user-ratio boost) and
+// merges nearby hits from the same conversation into grouped SearchResults.
+func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, offset int) ([]SearchResult, error) {
 	logger.Debugf("Searching for \"%s\" (chatJID=%s, limit=%d, offset=%d)", queryStr, chatJID, limit, offset)
+
 	// Build text query.
 	var textQuery query.Query
 	if chatJID != "" {
@@ -276,8 +458,10 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 		textQuery = bleve.NewMatchQuery(queryStr)
 	}
 
+	// Over-fetch to compensate for merging.
+	fetchSize := limit * 3
 	searchRequest := bleve.NewSearchRequest(textQuery)
-	searchRequest.Size = limit
+	searchRequest.Size = fetchSize
 	searchRequest.From = offset
 	searchRequest.SortBy([]string{"-_score", "-timestamp"})
 
@@ -288,16 +472,16 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 			if err != nil {
 				logger.Warnf("Failed to embed search query, falling back to text-only: %v", err)
 			} else {
-				searchRequest.AddKNN("embedding", queryVec, int64(limit) * 10, 0.75)
+				searchRequest.AddKNN("embedding", queryVec, int64(fetchSize)*10, 0.5)
 				searchRequest.Score = "rrf"
 			}
 		}
 	} else {
-		logger.Debugf("Not using embedder for this query");
+		logger.Debugf("Not using embedder for this query")
 	}
 
 	params := bleve.RequestParams{
-		ScoreWindowSize: 150,                     // Window size (default: size)
+		ScoreWindowSize: 150,
 	}
 	searchRequest.AddParams(params)
 
@@ -308,9 +492,9 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 		return nil, err
 	}
 
-	// Apply custom rescoring and fetch full messages from SQLite.
-	var results []Message
+	// Apply custom rescoring.
 	chatRatios := make(map[string]float64)
+	var hits []rescoredHit
 
 	for _, hit := range searchResult.Hits {
 		idParts := strings.SplitN(hit.ID, ":", 2)
@@ -319,6 +503,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 		}
 		hitChatJID := idParts[0]
 		messageID := idParts[1]
+
 		doc, err := store.GetMessage(messageID, hitChatJID)
 		if err != nil {
 			continue
@@ -341,10 +526,72 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 		}
 		hit.Score *= (1.0 + ratio)
 
-		results = append(results, *doc)
+		hits = append(hits, rescoredHit{
+			chatJID:   hitChatJID,
+			timestamp: doc.Time,
+			score:     hit.Score,
+		})
 	}
 
-	return results, nil
+	// Merge hits from the same chat within the context window into single results.
+	var merged []SearchResult
+	for _, h := range hits {
+		// Check if this hit merges into an existing result.
+		found := false
+		for i := range merged {
+			if merged[i].ChatJID != h.chatJID {
+				continue
+			}
+			// Check time overlap with any message in the existing group.
+			for _, m := range merged[i].Messages {
+				if math.Abs(m.Time.Sub(h.timestamp).Seconds()) < contextWindowDuration.Seconds() {
+					// Merge: keep best score.
+					if h.score > merged[i].Score {
+						merged[i].Score = h.score
+					}
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		// New result group: fetch context window from DB.
+		ctxMsgs, err := getContextWindow(store.db, h.chatJID, h.timestamp)
+		if err != nil {
+			logger.Warnf("Failed to get context window for search result: %v", err)
+			continue
+		}
+
+		// Convert contextMsg to Message.
+		messages := make([]Message, 0, len(ctxMsgs))
+		for _, cm := range ctxMsgs {
+			messages = append(messages, Message{
+				Time:     cm.Timestamp,
+				Sender:   cm.Sender,
+				FullName: cm.FullName,
+				Content:  cm.Content,
+			})
+		}
+
+		merged = append(merged, SearchResult{
+			ChatJID:  h.chatJID,
+			ChatName: store.GetChatNameByJID(h.chatJID),
+			Score:    h.score,
+			Messages: messages,
+		})
+
+		if len(merged) >= limit {
+			break
+		}
+	}
+
+	return merged, nil
 }
 
 // deleteIndex removes the bleve index directory so it can be recreated.
