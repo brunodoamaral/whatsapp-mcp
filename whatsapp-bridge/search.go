@@ -52,9 +52,9 @@ type SearchResult struct {
 const indexPath = "store/messages.bleve"
 
 const (
-	contextWindowDuration = 5 * time.Minute
-	contextMinMsgs        = 8
-	contextMaxMsgs        = 32
+	contextWindowDuration = 30 * time.Minute
+	contextMinMsgs        = 32
+	contextMaxMsgs        = 64
 )
 
 // getContextWindow fetches messages from the same chat within a time-based window
