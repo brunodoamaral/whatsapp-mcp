@@ -1,0 +1,10 @@
+{
+    "go.buildTags": "vectors,full",
+    "go.buildFlags": [
+        "-tags=vectors,full"
+    ],
+    "go.toolsEnvVars": {
+        "CGO_LDFLAGS": "-L/usr/local/lib",
+        "CGO_CFLAGS": "-I/usr/local/include"
+    }
+}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
+	"github.com/gomlx/go-huggingface/tokenizers/api"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -35,7 +36,8 @@ const (
 
 // seqLenBuckets defines the allowed sequence lengths for cached sessions.
 // padLen is rounded up to the first bucket that fits.
-var seqLenBuckets = []int{16, 32, 48, 56, 64, 72, 80, 96, 128}
+var seqLenBuckets = []int{16, 32, 64, 80, 96, 112, 128, 140, 160, 200, 220, 256}
+var maxSequenceLen = seqLenBuckets[len(seqLenBuckets)-1]
 
 // embeddingModelConfig holds relevant fields from config.json at the repo root.
 type embeddingModelConfig struct {
@@ -67,6 +69,7 @@ type Embedder struct {
 	outIdx     int
 	embDim     int
 	maxSeqLen  int
+	padTokenId int
 	// sessions is a cache of ONNX sessions keyed by sequence length.
 	// Each unique padLen encountered gets its own session, created on first use.
 	sessions map[int]*sessionEntry
@@ -155,6 +158,13 @@ func NewEmbedder(modelID, onnxFile string) (*Embedder, error) {
 		return nil, fmt.Errorf("create tokenizer: %w", err)
 	}
 
+	// 5. Get PadToken ID from tokenizer config, if available.
+	padTokenId, err := tok.SpecialTokenID(api.TokPad)
+	if err != nil {
+		ort.DestroyEnvironment()
+		return nil, fmt.Errorf("create tokenizer: %w", err)
+	}
+
 	outIdx := chooseOutputIndex(outputInfo)
 
 	return &Embedder{
@@ -165,6 +175,7 @@ func NewEmbedder(modelID, onnxFile string) (*Embedder, error) {
 		outIdx:     outIdx,
 		embDim:     embDim,
 		maxSeqLen:  maxSeqLen,
+		padTokenId: padTokenId,
 		sessions:   make(map[int]*sessionEntry),
 	}, nil
 }
@@ -292,14 +303,14 @@ func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
 	// Tokenize all texts; find actual padLen for this batch.
 	tokenized := make([][]int64, batchSize)
 	padLen := 0
+	efectiveMaxSeqLen := e.maxSeqLen
+	if efectiveMaxSeqLen > maxSequenceLen {
+		efectiveMaxSeqLen = maxSequenceLen
+	}
 	for i, text := range texts {
 		rawIDs := e.tok.Encode(text)
-		maxLen := e.maxSeqLen
-		if maxLen > 128 {
-			maxLen = 128
-		}
-		if len(rawIDs) > maxLen {
-			rawIDs = rawIDs[:maxLen]
+		if len(rawIDs) > efectiveMaxSeqLen {
+			rawIDs = rawIDs[:efectiveMaxSeqLen]
 		}
 		ids := make([]int64, len(rawIDs))
 		for j, id := range rawIDs {
@@ -332,7 +343,7 @@ func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
 
 	// Zero out buffers, then fill actual data.
 	for i := range s.flatIDs {
-		s.flatIDs[i] = 0
+		s.flatIDs[i] = int64(e.padTokenId)
 		s.flatMask[i] = 0
 	}
 	for i, ids := range tokenized {
