@@ -10,6 +10,8 @@ import (
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/mapping"
 	"github.com/blevesearch/bleve/v2/search/query"
+
+	_ "github.com/blevesearch/bleve/v2/analysis/lang/pt"
 )
 
 // MessageDocument represents a message for bleve indexing.
@@ -51,9 +53,11 @@ func openOrCreateIndex(embDim int) (bleve.Index, error) {
 // vector field for hybrid search.
 func buildIndexMapping(embDim int) mapping.IndexMapping {
 	m := bleve.NewIndexMapping()
+	m.ScoringModel = "bm25"
 
 	textFieldMapping := bleve.NewTextFieldMapping()
-	textFieldMapping.Analyzer = "en"
+	textFieldMapping.Analyzer = "pt"
+
 
 	m.DefaultMapping.AddFieldMappingsAt("content", textFieldMapping)
 	m.DefaultMapping.AddFieldMappingsAt("sender", textFieldMapping)
@@ -100,66 +104,165 @@ func indexMessage(index bleve.Index, embedder *Embedder, id, chatJID, sender, fu
 	}
 }
 
-// reIndexAllMessages re-indexes every message from the database into bleve.
-func reIndexAllMessages(store *MessageStore) error {
+// reindexRow holds a scanned DB row during batch re-indexing.
+type reindexRow struct {
+	doc  MessageDocument
+	text string // sanitised text to embed, or "" if skipped
+}
+
+const (
+	dbPageSize = 500 // rows fetched from SQLite per query
+	// embBatch is defined in embedding.go
+)
+
+// reIndexAllMessages re-indexes every message from the database into bleve
+// using batch ONNX inference (embBatch texts per call) and bleve batch inserts
+// (one commit per DB page).
+func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	logger.Infof("Starting re-indexing of all messages...")
 
-	// Check if index is empty — skip re-index if it already has documents.
+	// Skip if index already populated.
 	count, err := store.index.DocCount()
 	if err == nil && count > 0 {
 		logger.Infof("Index already has %d documents, skipping re-index", count)
 		return nil
 	}
 
-	const batchSize = 500
+	var total int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE content != '' OR media_type != ''`).Scan(&total); err != nil {
+		logger.Warnf("Could not count messages: %v", err)
+	}
+	if maxRows > 0 && total > maxRows {
+		total = maxRows
+	}
+	logger.Infof("Re-indexing %d messages...", total)
+
 	offset := 0
 	indexed := 0
+	startTime := time.Now()
+	lastReport := startTime
+	lastReportIdx := 0
 
 	for {
+		pageSize := dbPageSize
+		if maxRows > 0 && indexed+pageSize > maxRows {
+			pageSize = maxRows - indexed
+		}
+
 		rows, err := store.db.Query(`
 			SELECT id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename
 			FROM messages
 			WHERE content != '' OR media_type != ''
 			ORDER BY rowid
 			LIMIT ? OFFSET ?
-		`, batchSize, offset)
+		`, pageSize, offset)
 		if err != nil {
 			return fmt.Errorf("failed to query messages: %v", err)
 		}
 
-		count := 0
+		// Scan the full page into memory.
+		page := make([]reindexRow, 0, dbPageSize)
 		for rows.Next() {
-			var id, chatJID, sender, fullName, content, mediaType, filename string
-			var timestamp time.Time
-			var isFromMe bool
-
-			err := rows.Scan(&id, &chatJID, &sender, &fullName, &content, &timestamp, &isFromMe, &mediaType, &filename)
+			var r reindexRow
+			err := rows.Scan(&r.doc.ID, &r.doc.ChatJID, &r.doc.Sender, &r.doc.FullName,
+				&r.doc.Content, &r.doc.Timestamp, &r.doc.IsFromMe, &r.doc.MediaType, &r.doc.Filename)
 			if err != nil {
 				logger.Warnf("Error scanning message: %v", err)
 				continue
 			}
-
-			indexMessage(store.index, store.embedder, id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename)
-			indexed++
-			count++
+			r.text = sanitizeForEmbedding(r.doc.Content)
+			page = append(page, r)
 		}
 		rows.Close()
 
-		logger.Debugf("Batch reindex messages from %d to %d", offset, offset+count)
-
-		if count < batchSize {
+		if len(page) == 0 {
 			break
 		}
-		offset += batchSize
+
+		// --- Batch embedding ---
+		// Collect indices of rows that have embeddable text.
+		if store.embedder != nil {
+			embIdxs := make([]int, 0, embBatch)
+			embTexts := make([]string, 0, embBatch)
+
+			flush := func() {
+				if len(embTexts) == 0 {
+					return
+				}
+				vecs, err := store.embedder.EmbedBatch(embTexts)
+				if err != nil {
+					logger.Warnf("EmbedBatch failed: %v", err)
+				} else {
+					for j, idx := range embIdxs {
+						page[idx].doc.Embedding = vecs[j]
+					}
+				}
+				embIdxs = embIdxs[:0]
+				embTexts = embTexts[:0]
+			}
+
+			for i := range page {
+				if page[i].text == "" {
+					continue
+				}
+				embIdxs = append(embIdxs, i)
+				embTexts = append(embTexts, page[i].text)
+				if len(embTexts) == embBatch {
+					flush()
+				}
+			}
+			flush() // remaining partial batch
+		}
+
+		// --- Bleve batch insert ---
+		batch := store.index.NewBatch()
+		for i := range page {
+			docID := page[i].doc.ChatJID + ":" + page[i].doc.ID
+			if err := batch.Index(docID, page[i].doc); err != nil {
+				logger.Warnf("Failed to stage doc %s in batch: %v", docID, err)
+			}
+		}
+		if err := store.index.Batch(batch); err != nil {
+			logger.Warnf("Failed to commit bleve batch at offset %d: %v", offset, err)
+		}
+
+		indexed += len(page)
+
+		now := time.Now()
+		pageElapsed := now.Sub(lastReport).Seconds()
+		if pageElapsed > 0 {
+			pageMsgsPerSec := float64(indexed-lastReportIdx) / pageElapsed
+			totalElapsed := now.Sub(startTime).Seconds()
+			totalMsgsPerSec := float64(indexed) / totalElapsed
+			avgTok := 0.0
+			if store.embedder != nil {
+				avgTok = store.embedder.AvgTokens()
+			}
+			logger.Debugf("Re-indexed %d/%d messages | page: %.0f msg/s | overall: %.0f msg/s | elapsed: %.1fs | avg tokens/msg: %.1f",
+				indexed, total, pageMsgsPerSec, totalMsgsPerSec, totalElapsed, avgTok)
+		}
+		lastReport = now
+		lastReportIdx = indexed
+
+		if len(page) < pageSize || (maxRows > 0 && indexed >= maxRows) {
+			break
+		}
+		offset += pageSize
 	}
 
-	logger.Infof("Re-indexed %d messages", indexed)
+	totalElapsed := time.Since(startTime).Seconds()
+	overallRate := 0.0
+	if totalElapsed > 0 {
+		overallRate = float64(indexed) / totalElapsed
+	}
+	logger.Infof("Re-indexed %d messages in %.1fs (%.0f msg/s)", indexed, totalElapsed, overallRate)
 	return nil
 }
 
 // searchMessages performs a hybrid text + vector search using bleve's score
 // fusion, then applies custom rescoring (mute penalty, user-ratio boost).
 func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, offset int) ([]Message, error) {
+	logger.Debugf("Searching for \"%s\" (chatJID=%s, limit=%d, offset=%d)", queryStr, chatJID, limit, offset)
 	// Build text query.
 	var textQuery query.Query
 	if chatJID != "" {
@@ -185,11 +288,20 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 			if err != nil {
 				logger.Warnf("Failed to embed search query, falling back to text-only: %v", err)
 			} else {
-				searchRequest.AddKNN("embedding", queryVec, int64(limit), 1.0)
+				searchRequest.AddKNN("embedding", queryVec, int64(limit) * 10, 0.75)
 				searchRequest.Score = "rrf"
 			}
 		}
+	} else {
+		logger.Debugf("Not using embedder for this query");
 	}
+
+	params := bleve.RequestParams{
+		ScoreWindowSize: 150,                     // Window size (default: size)
+	}
+	searchRequest.AddParams(params)
+
+	logger.Debugf("searchRequest = %+v", searchRequest)
 
 	searchResult, err := store.index.Search(searchRequest)
 	if err != nil {

@@ -26,13 +26,36 @@ const (
 	ortBaseURL = "https://github.com/microsoft/onnxruntime/releases/download/v" + ortVersion + "/"
 	ortTarball = "onnxruntime-linux-aarch64-" + ortVersion + ".tgz"
 	ortLibName = "libonnxruntime.so." + ortVersion
+
+	// embBatch is the number of texts per ONNX inference call. The persistent
+	// session is pre-allocated for exactly this many inputs. Must match the
+	// constant of the same name in search.go.
+	embBatch = 8
 )
+
+// seqLenBuckets defines the allowed sequence lengths for cached sessions.
+// padLen is rounded up to the first bucket that fits.
+var seqLenBuckets = []int{8, 16, 24, 32, 48, 64}
 
 // embeddingModelConfig holds relevant fields from config.json at the repo root.
 type embeddingModelConfig struct {
 	HiddenSize            int `json:"hidden_size"`
 	Dim                   int `json:"dim"`
 	MaxPositionEmbeddings int `json:"max_position_embeddings"`
+}
+
+// sessionEntry holds a cached ONNX session and its pre-allocated tensors for a
+// specific sequence length.
+type sessionEntry struct {
+	seqLen    int
+	flatIDs   []int64
+	flatMask  []int64
+	flatTypes []int64
+	inIDs     *ort.Tensor[int64]
+	inMask    *ort.Tensor[int64]
+	inTypes   *ort.Tensor[int64]
+	outTensor *ort.Tensor[float32]
+	session   *ort.AdvancedSession
 }
 
 // Embedder wraps an ONNX sentence-transformer model for generating text embeddings.
@@ -44,6 +67,20 @@ type Embedder struct {
 	outIdx     int
 	embDim     int
 	maxSeqLen  int
+	// sessions is a cache of ONNX sessions keyed by sequence length.
+	// Each unique padLen encountered gets its own session, created on first use.
+	sessions map[int]*sessionEntry
+	// token stats for reporting
+	totalTokens int64
+	totalTexts  int64
+}
+
+// AvgTokens returns the average number of tokens per embedded text seen so far.
+func (e *Embedder) AvgTokens() float64 {
+	if e.totalTexts == 0 {
+		return 0
+	}
+	return float64(e.totalTokens) / float64(e.totalTexts)
 }
 
 // NewEmbedder initialises the ONNX Runtime, downloads the model, and prepares
@@ -128,71 +165,60 @@ func NewEmbedder(modelID, onnxFile string) (*Embedder, error) {
 		outIdx:     outIdx,
 		embDim:     embDim,
 		maxSeqLen:  maxSeqLen,
+		sessions:   make(map[int]*sessionEntry),
 	}, nil
 }
 
-// EmbDim returns the embedding dimensionality.
-func (e *Embedder) EmbDim() int {
-	return e.embDim
-}
-
-// Embed generates a normalised embedding vector for the given text.
-func (e *Embedder) Embed(text string) ([]float32, error) {
-	rawIDs := e.tok.Encode(text)
-	if len(rawIDs) > e.maxSeqLen {
-		rawIDs = rawIDs[:e.maxSeqLen]
-	}
-	seqLen := len(rawIDs)
-	if seqLen == 0 {
-		return nil, fmt.Errorf("tokenizer produced no tokens for input")
+// getSession returns a cached session for the given seqLen, creating one if needed.
+func (e *Embedder) getSession(seqLen int) (*sessionEntry, error) {
+	if s, ok := e.sessions[seqLen]; ok {
+		return s, nil
 	}
 
-	inputIDs := make([]int64, seqLen)
-	for i, id := range rawIDs {
-		inputIDs[i] = int64(id)
+	n := embBatch * seqLen
+	s := &sessionEntry{
+		seqLen:    seqLen,
+		flatIDs:   make([]int64, n),
+		flatMask:  make([]int64, n),
+		flatTypes: make([]int64, n),
 	}
 
-	shape := ort.NewShape(1, int64(seqLen))
+	shape := ort.NewShape(int64(embBatch), int64(seqLen))
 
-	attentionMask := make([]int64, seqLen)
-	tokenTypeIDs := make([]int64, seqLen)
-	for i := range attentionMask {
-		attentionMask[i] = 1
-	}
-
-	inIDs, err := ort.NewTensor(shape, inputIDs)
+	var err error
+	s.inIDs, err = ort.NewTensor(shape, s.flatIDs)
 	if err != nil {
 		return nil, fmt.Errorf("create input_ids tensor: %w", err)
 	}
-	defer inIDs.Destroy()
-
-	inMask, err := ort.NewTensor(shape, attentionMask)
+	s.inMask, err = ort.NewTensor(shape, s.flatMask)
 	if err != nil {
+		s.inIDs.Destroy()
 		return nil, fmt.Errorf("create attention_mask tensor: %w", err)
 	}
-	defer inMask.Destroy()
-
-	inTypes, err := ort.NewTensor(shape, tokenTypeIDs)
+	s.inTypes, err = ort.NewTensor(shape, s.flatTypes)
 	if err != nil {
+		s.inIDs.Destroy()
+		s.inMask.Destroy()
 		return nil, fmt.Errorf("create token_type_ids tensor: %w", err)
 	}
-	defer inTypes.Destroy()
 
-	knownInputs := map[string]ort.ArbitraryTensor{
-		"input_ids":      inIDs,
-		"attention_mask": inMask,
-		"token_type_ids": inTypes,
+	knownInputs := map[string]*ort.Tensor[int64]{
+		"input_ids":      s.inIDs,
+		"attention_mask": s.inMask,
+		"token_type_ids": s.inTypes,
 	}
 	sessionInputs := make([]ort.ArbitraryTensor, len(e.inputNames))
 	for i, name := range e.inputNames {
 		t, ok := knownInputs[name]
 		if !ok {
+			s.inIDs.Destroy()
+			s.inMask.Destroy()
+			s.inTypes.Destroy()
 			return nil, fmt.Errorf("model requires input %q but no tensor was prepared", name)
 		}
 		sessionInputs[i] = t
 	}
 
-	// Allocate output tensor.
 	chosenOutInfo := e.outputInfo[e.outIdx]
 	outDims := make([]int64, len(chosenOutInfo.Dimensions))
 	for j, d := range chosenOutInfo.Dimensions {
@@ -200,47 +226,148 @@ func (e *Embedder) Embed(text string) ([]float32, error) {
 		case d > 0:
 			outDims[j] = d
 		case j == 0:
-			outDims[j] = 1
+			outDims[j] = int64(embBatch)
 		case j == 1:
 			outDims[j] = int64(seqLen)
 		default:
 			outDims[j] = int64(e.embDim)
 		}
 	}
-	outTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(outDims...))
+	s.outTensor, err = ort.NewEmptyTensor[float32](ort.NewShape(outDims...))
 	if err != nil {
+		s.inIDs.Destroy()
+		s.inMask.Destroy()
+		s.inTypes.Destroy()
 		return nil, fmt.Errorf("create output tensor: %w", err)
 	}
-	defer outTensor.Destroy()
 
-	session, err := ort.NewAdvancedSession(
+	s.session, err = ort.NewAdvancedSession(
 		e.onnxPath,
 		e.inputNames,
 		[]string{chosenOutInfo.Name},
 		sessionInputs,
-		[]ort.ArbitraryTensor{outTensor},
+		[]ort.ArbitraryTensor{s.outTensor},
 		nil,
 	)
 	if err != nil {
+		s.inIDs.Destroy()
+		s.inMask.Destroy()
+		s.inTypes.Destroy()
+		s.outTensor.Destroy()
 		return nil, fmt.Errorf("create ORT session: %w", err)
 	}
-	defer session.Destroy()
 
-	if err := session.Run(); err != nil {
+	e.sessions[seqLen] = s
+	return s, nil
+}
+
+// EmbDim returns the embedding dimensionality.
+func (e *Embedder) EmbDim() int {
+	return e.embDim
+}
+
+// Embed generates a normalised embedding vector for a single text.
+func (e *Embedder) Embed(text string) ([]float32, error) {
+	vecs, err := e.EmbedBatch([]string{text})
+	if err != nil {
+		return nil, err
+	}
+	return vecs[0], nil
+}
+
+// EmbedBatch generates normalised embedding vectors for a batch of texts in a
+// single ONNX inference call. len(texts) must be <= embBatch. Sequences are
+// padded to the longest one in the batch; a session is created for that
+// sequence length on first use and reused on subsequent calls with the same
+// length. Returns one vector per input text (same order).
+func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
+	batchSize := len(texts)
+	if batchSize == 0 {
+		return nil, nil
+	}
+	if batchSize > embBatch {
+		return nil, fmt.Errorf("batch size %d exceeds session batch size %d", batchSize, embBatch)
+	}
+
+	// Tokenize all texts; find actual padLen for this batch.
+	tokenized := make([][]int64, batchSize)
+	padLen := 0
+	for i, text := range texts {
+		rawIDs := e.tok.Encode(text)
+		maxLen := e.maxSeqLen
+		if maxLen > 64 {
+			maxLen = 64
+		}
+		if len(rawIDs) > maxLen {
+			rawIDs = rawIDs[:maxLen]
+		}
+		ids := make([]int64, len(rawIDs))
+		for j, id := range rawIDs {
+			ids[j] = int64(id)
+		}
+		tokenized[i] = ids
+		if len(ids) > padLen {
+			padLen = len(ids)
+		}
+		e.totalTokens += int64(len(ids))
+		e.totalTexts++
+	}
+	if padLen == 0 {
+		return nil, fmt.Errorf("all inputs produced empty token sequences")
+	}
+
+	// Round up to the next pre-defined bucket to bound the number of cached sessions.
+	seqLen := seqLenBuckets[len(seqLenBuckets)-1]
+	for _, b := range seqLenBuckets {
+		if b >= padLen {
+			seqLen = b
+			break
+		}
+	}
+
+	s, err := e.getSession(seqLen)
+	if err != nil {
+		return nil, err
+	}
+
+	// Zero out buffers, then fill actual data.
+	for i := range s.flatIDs {
+		s.flatIDs[i] = 0
+		s.flatMask[i] = 0
+	}
+	for i, ids := range tokenized {
+		base := i * seqLen
+		for j, id := range ids {
+			s.flatIDs[base+j] = id
+			s.flatMask[base+j] = 1
+		}
+	}
+
+	if err := s.session.Run(); err != nil {
 		return nil, fmt.Errorf("ORT inference: %w", err)
 	}
 
-	data := outTensor.GetData()
-	outShape := outTensor.GetShape()
+	pooled := meanPoolOutput(s.outTensor.GetData(), s.outTensor.GetShape(), s.flatMask, embBatch, seqLen, e.embDim)
 
-	embedding := meanPoolOutput(data, outShape, attentionMask, 1, seqLen, e.embDim)
-	l2Normalize(embedding)
-
-	return embedding, nil
+	result := make([][]float32, batchSize)
+	for i := range result {
+		vec := make([]float32, e.embDim)
+		copy(vec, pooled[i*e.embDim:(i+1)*e.embDim])
+		l2Normalize(vec)
+		result[i] = vec
+	}
+	return result, nil
 }
 
 // Close releases ONNX Runtime resources.
 func (e *Embedder) Close() {
+	for _, s := range e.sessions {
+		s.session.Destroy()
+		s.outTensor.Destroy()
+		s.inTypes.Destroy()
+		s.inMask.Destroy()
+		s.inIDs.Destroy()
+	}
 	ort.DestroyEnvironment()
 }
 

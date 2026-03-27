@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"runtime/pprof"
 	"math"
 	"math/rand"
 	"net/http"
@@ -266,8 +268,8 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 }
 
 // ReIndexAllMessages delegates to the search module.
-func (store *MessageStore) ReIndexAllMessages() error {
-	return reIndexAllMessages(store)
+func (store *MessageStore) ReIndexAllMessages(maxRows int) error {
+	return reIndexAllMessages(store, maxRows)
 }
 
 // Get mute status for a chat
@@ -1053,6 +1055,70 @@ func main() {
 		logLevel = "DEBUG"
 	}
 	logger = waLog.Stdout("Client", logLevel, true)
+
+	reindex := flag.Bool("reindex", false, "delete and rebuild the search index, then exit")
+	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file (use with --reindex)")
+	maxRows := flag.Int("max-rows", 0, "limit rows processed during --reindex (0 = unlimited, useful with --cpuprofile)")
+	flag.Parse()
+
+	if *reindex {
+		var profFile *os.File
+		stopProfile := func() {
+			if profFile != nil {
+				pprof.StopCPUProfile()
+				profFile.Close()
+				profFile = nil
+			}
+		}
+
+		if *cpuprofile != "" {
+			f, err := os.Create(*cpuprofile)
+			if err != nil {
+				logger.Errorf("Could not create CPU profile: %v", err)
+				os.Exit(1)
+			}
+			if err := pprof.StartCPUProfile(f); err != nil {
+				logger.Errorf("Could not start CPU profile: %v", err)
+				f.Close()
+				os.Exit(1)
+			}
+			profFile = f
+
+			// Flush profile on Ctrl+C
+			sigs := make(chan os.Signal, 1)
+			signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigs
+				logger.Infof("Interrupted — flushing CPU profile to %s", *cpuprofile)
+				stopProfile()
+				os.Exit(1)
+			}()
+		}
+
+		logger.Infof("--reindex: deleting existing index at %s", indexPath)
+		if err := deleteIndex(); err != nil {
+			logger.Errorf("Failed to delete index: %v", err)
+			stopProfile()
+			os.Exit(1)
+		}
+		messageStore, err := NewMessageStore()
+		if err != nil {
+			logger.Errorf("Failed to initialise message store: %v", err)
+			stopProfile()
+			os.Exit(1)
+		}
+		if err := messageStore.ReIndexAllMessages(*maxRows); err != nil {
+			logger.Errorf("Re-indexing failed: %v", err)
+			messageStore.Close()
+			stopProfile()
+			os.Exit(1)
+		}
+		messageStore.Close()
+		stopProfile()
+		logger.Infof("Re-indexing complete, exiting.")
+		os.Exit(0)
+	}
+
 	logger.Infof("Starting WhatsApp client...")
 
 	// Update WhatsApp version to latest
@@ -1112,7 +1178,7 @@ func main() {
 
 	// Re-index existing messages
 	go func() {
-		err := messageStore.ReIndexAllMessages()
+		err := messageStore.ReIndexAllMessages(0)
 		if err != nil {
 			logger.Errorf("Failed to re-index messages: %v", err)
 		}
