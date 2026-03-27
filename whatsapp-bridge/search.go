@@ -313,22 +313,23 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 
 		// Load all messages for this chat.
 		msgRows, err := store.db.Query(`
-			SELECT m.id, m.sender, m.full_name, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
-			FROM messages m
-			LEFT JOIN messages r ON m.reply_to_id = r.id
-			WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
-			ORDER BY m.timestamp
-		`, jid)
+				SELECT m.id, m.sender, m.full_name, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
+				FROM messages m
+				LEFT JOIN messages r ON m.reply_to_id = r.id
+				WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
+				ORDER BY m.timestamp
+			`, jid)
 		if err != nil {
 			logger.Warnf("Failed to query messages for %s: %v", jid, err)
 			continue
 		}
 
 		type rawMsg struct {
-			id, sender, fullName, content, replyToContent string
-			timestamp                                     time.Time
-			isFromMe                                      bool
-			mediaType, filename                           string
+			id, sender, fullName, content string
+			replyToContent                sql.NullString
+			timestamp                     time.Time
+			isFromMe                      bool
+			mediaType, filename           string
 		}
 		var msgs []rawMsg
 		for msgRows.Next() {
@@ -366,7 +367,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 					FullName:       m.fullName,
 					Content:        m.content,
 					Timestamp:      m.timestamp,
-					ReplyToContent: m.replyToContent,
+					ReplyToContent: m.replyToContent.String,
 				}
 			}
 			ctxStr := formatContextWindow(ctxMsgs)
@@ -397,7 +398,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 			if store.embedder != nil {
 				avgTok = store.embedder.AvgTokens()
 			}
-			logger.Debugf("Re-indexed %d/%d messages (%d groups) | chat: %.0f msg/s | overall: %.0f msg/s | elapsed: %.1fs | avg tokens/msg: %.1f",
+			logger.Debugf("Re-indexed %d/%d messages (%d contexts) | chat: %.0f msg/s | overall: %.0f msg/s | elapsed: %.1fs | avg tokens/msg: %.1f",
 				indexed, total, groups, chatMsgsPerSec, overallRate, totalElapsed, avgTok)
 		}
 		lastReport = now
