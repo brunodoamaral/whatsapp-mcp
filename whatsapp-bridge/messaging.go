@@ -91,6 +91,21 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// extractReplyToID returns the stanza ID of the quoted message if this is a reply, or "" otherwise.
+func extractReplyToID(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+	ctx := msg.GetExtendedTextMessage().GetContextInfo()
+	if ctx == nil {
+		return ""
+	}
+	if ctx.GetQuotedMessage() == nil {
+		return ""
+	}
+	return ctx.GetStanzaID()
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {

@@ -61,6 +61,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Extract reply-to message ID if this is a reply
+	replyToID := extractReplyToID(msg.Message)
+
 	// Store message in database with contact's full name for indexing
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
@@ -77,6 +80,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		replyToID,
 	)
 
 	if err != nil {
@@ -317,6 +321,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					senderFullName = sender
 				}
 
+				histReplyToID := ""
+				if msg.Message.Message != nil {
+					histReplyToID = extractReplyToID(msg.Message.Message)
+				}
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -332,6 +341,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					histReplyToID,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

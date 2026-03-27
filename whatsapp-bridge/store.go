@@ -19,6 +19,7 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+	ReplyToID string
 }
 
 // MessageStore handles message persistence (SQLite) and search (bleve + embeddings).
@@ -64,6 +65,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			reply_to_id TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -74,6 +76,9 @@ func NewMessageStore() (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+
+	// Migration: add reply_to_id column to existing databases.
+	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN reply_to_id TEXT`)
 
 	// Initialise embedder (best-effort — search still works text-only without it).
 	logger.Infof("Initialising embedding model...")
@@ -133,9 +138,17 @@ func stringPtrValue(s *string) interface{} {
 	return *s
 }
 
+// nullableString returns nil for empty strings so they are stored as NULL.
+func nullableString(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, replyToID string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -143,9 +156,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullableString(replyToID),
 	)
 	if err != nil {
 		return err
@@ -161,10 +174,11 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, error) {
 	var msg Message
 	var timestamp time.Time
+	var replyToID sql.NullString
 	err := store.db.QueryRow(
-		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE id = ? AND chat_jid = ?",
 		id, chatJID,
-	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -174,13 +188,16 @@ func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, erro
 	}
 
 	msg.Time = timestamp
+	if replyToID.Valid {
+		msg.ReplyToID = replyToID.String
+	}
 	return &msg, nil
 }
 
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -192,11 +209,15 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		err := rows.Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		var replyToID sql.NullString
+		err := rows.Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
 		if err != nil {
 			return nil, err
 		}
 		msg.Time = timestamp
+		if replyToID.Valid {
+			msg.ReplyToID = replyToID.String
+		}
 		messages = append(messages, msg)
 	}
 
