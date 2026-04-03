@@ -295,9 +295,62 @@ func (store *MessageStore) calculateUserMessageRatio(chatJID string) (float64, e
 	return float64(userMessages) / float64(totalMessages), nil
 }
 
+// MessageFilter holds optional constraints for GetMessagesFiltered.
+type MessageFilter struct {
+	Limit  int
+	Offset int
+	Start  *time.Time
+	End    *time.Time
+}
+
+// GetMessagesFiltered returns messages for a chat with optional date range and
+// pagination. Results are ordered newest-first.
+func (store *MessageStore) GetMessagesFiltered(chatJID string, f MessageFilter) ([]MessageWithID, error) {
+	query := "SELECT id, sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ?"
+	args := []interface{}{chatJID}
+
+	if f.Start != nil {
+		query += " AND timestamp >= ?"
+		args = append(args, *f.Start)
+	}
+	if f.End != nil {
+		query += " AND timestamp <= ?"
+		args = append(args, *f.End)
+	}
+
+	query += " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+	args = append(args, f.Limit, f.Offset)
+
+	rows, err := store.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []MessageWithID
+	for rows.Next() {
+		var msg MessageWithID
+		var timestamp time.Time
+		var replyToID sql.NullString
+		err := rows.Scan(&msg.ID, &msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
+		if err != nil {
+			return nil, err
+		}
+		msg.Time = timestamp
+		if replyToID.Valid {
+			msg.ReplyToID = replyToID.String
+		}
+		messages = append(messages, msg)
+	}
+	if messages == nil {
+		messages = []MessageWithID{}
+	}
+	return messages, nil
+}
+
 // SearchMessages delegates to the search module.
-func (store *MessageStore) SearchMessages(queryStr string, chatJID string, limit int, semanticWeight float64) ([]SearchResult, error) {
-	return searchMessages(store, queryStr, chatJID, limit, semanticWeight)
+func (store *MessageStore) SearchMessages(queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int) ([]SearchResult, error) {
+	return searchMessages(store, queryStr, chatJIDs, limit, semanticWeight, daysSince)
 }
 
 // Store additional media info in the database

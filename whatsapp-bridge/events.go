@@ -14,7 +14,7 @@ import (
 )
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) *BroadcastMessage {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -58,7 +58,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
-		return
+		return nil
 	}
 
 	// Extract reply-to message ID if this is a reply
@@ -85,20 +85,37 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
-	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
+		return nil
+	}
 
-		// Log based on message type
-		if mediaType != "" {
-			logger.Debugf("[%s] %s %s: [%s: %s] %s", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			logger.Debugf("[%s] %s %s: %s", timestamp, direction, sender, content)
-		}
+	// Log message reception
+	timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
+	direction := "←"
+	if msg.Info.IsFromMe {
+		direction = "→"
+	}
+
+	// Log based on message type
+	if mediaType != "" {
+		logger.Debugf("[%s] %s %s: [%s: %s] %s", timestamp, direction, sender, mediaType, filename, content)
+	} else if content != "" {
+		logger.Debugf("[%s] %s %s: %s", timestamp, direction, sender, content)
+	}
+
+	return &BroadcastMessage{
+		ChatJID:  chatJID,
+		ChatName: name,
+		Message: MessageWithID{
+			ID:        msg.Info.ID,
+			Time:      msg.Info.Timestamp,
+			Sender:    sender,
+			FullName:  senderName,
+			Content:   content,
+			IsFromMe:  msg.Info.IsFromMe,
+			MediaType: mediaType,
+			Filename:  filename,
+			ReplyToID: replyToID,
+		},
 	}
 }
 

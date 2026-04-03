@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -9,12 +8,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/analysis"
 	"github.com/blevesearch/bleve/v2/mapping"
+	"github.com/blevesearch/bleve/v2/registry"
 	"github.com/blevesearch/bleve/v2/search/query"
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 
 	_ "github.com/blevesearch/bleve/v2/analysis/lang/pt"
+	_ "github.com/blevesearch/bleve/v2/analysis/token/unicodenorm"
 )
 
 // MessageDocument represents a context group document for bleve indexing.
@@ -46,6 +52,68 @@ type SearchResult struct {
 }
 
 const indexPath = "store/messages.bleve"
+
+const asciiFoldingFilterName = "ascii_folding_custom"
+const ptAsciiAnalyzerName = "pt_ascii"
+
+// asciiFoldingTokenFilter strips diacritical marks via NFD decomposition.
+type asciiFoldingTokenFilter struct{}
+
+func (f *asciiFoldingTokenFilter) Filter(input analysis.TokenStream) analysis.TokenStream {
+	t := transform.Chain(norm.NFD, transform.RemoveFunc(func(r rune) bool {
+		return unicode.Is(unicode.Mn, r) // strip non-spacing marks
+	}), norm.NFC)
+	for _, token := range input {
+		result, _, _ := transform.Bytes(t, token.Term)
+		token.Term = result
+	}
+	return input
+}
+
+func init() {
+	if err := registry.RegisterTokenFilter(asciiFoldingFilterName, func(_ map[string]interface{}, _ *registry.Cache) (analysis.TokenFilter, error) {
+		return &asciiFoldingTokenFilter{}, nil
+	}); err != nil {
+		panic(err)
+	}
+
+	// Register pt_ascii globally so it is available both when creating a new
+	// index and when reopening an existing one (bleve reconstructs analyzers
+	// from the stored metadata using the global registry).
+	if err := registry.RegisterAnalyzer(ptAsciiAnalyzerName, func(_ map[string]interface{}, cache *registry.Cache) (analysis.Analyzer, error) {
+		tokenizer, err := cache.TokenizerNamed("unicode")
+		if err != nil {
+			return nil, err
+		}
+		toLower, err := cache.TokenFilterNamed("to_lower")
+		if err != nil {
+			return nil, err
+		}
+		asciiFilter, err := cache.TokenFilterNamed(asciiFoldingFilterName)
+		if err != nil {
+			return nil, err
+		}
+		stopPt, err := cache.TokenFilterNamed("stop_pt")
+		if err != nil {
+			return nil, err
+		}
+		stemPt, err := cache.TokenFilterNamed("stemmer_pt_light")
+		if err != nil {
+			return nil, err
+		}
+		return &analysis.DefaultAnalyzer{
+			Tokenizer: tokenizer,
+			TokenFilters: []analysis.TokenFilter{
+				toLower,
+				asciiFilter,
+				stopPt,
+				stemPt,
+			},
+		}, nil
+	}); err != nil {
+		panic(err)
+	}
+}
 
 const contextNumMessages = 16 // messages per indexed context group
 
@@ -104,9 +172,10 @@ func openOrCreateIndex(embDim int) (bleve.Index, error) {
 func buildIndexMapping(embDim int) mapping.IndexMapping {
 	m := bleve.NewIndexMapping()
 	m.ScoringModel = "bm25"
+	m.DefaultAnalyzer = ptAsciiAnalyzerName
 
 	textFieldMapping := bleve.NewTextFieldMapping()
-	textFieldMapping.Analyzer = "pt"
+	textFieldMapping.Analyzer = ptAsciiAnalyzerName
 
 	m.DefaultMapping.AddFieldMappingsAt("context", textFieldMapping)
 
@@ -225,7 +294,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	}
 
 	var total int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE content != '' OR media_type != ''`).Scan(&total); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE (content != '' OR media_type != '')`).Scan(&total); err != nil {
 		logger.Warnf("Could not count messages: %v", err)
 	}
 	if maxRows > 0 && total > maxRows {
@@ -233,11 +302,24 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	}
 	logger.Infof("Re-indexing %d messages...", total)
 
+	bar := progressbar.NewOptions(total,
+		progressbar.OptionSetDescription("indexing"),
+		progressbar.OptionSetWidth(20),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionSetItsString("msg"),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+
 	indexed := 0 // raw messages processed
 	groups := 0  // group docs written to bleve
 	startTime := time.Now()
-	lastReport := startTime
-	lastReportIdx := 0
 
 	// emitDocs embeds a slice of group docs and writes them to bleve.
 	emitDocs := func(docs []reindexRow) {
@@ -293,7 +375,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 
 	// Get all chat_jids with indexable messages.
 	chatRows, err := store.db.Query(
-		`SELECT DISTINCT chat_jid FROM messages WHERE content != '' OR media_type != ''`,
+		`SELECT DISTINCT chat_jid FROM messages WHERE (content != '' OR media_type != '')`,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to query chat_jids: %v", err)
@@ -326,11 +408,13 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 		}
 
 		type rawMsg struct {
-			id, sender, fullName, content string
-			replyToContent                sql.NullString
-			timestamp                     time.Time
-			isFromMe                      bool
-			mediaType, filename           string
+			id, sender, fullName string
+			content              sql.NullString
+			replyToContent       sql.NullString
+			timestamp            time.Time
+			isFromMe             bool
+			mediaType            sql.NullString
+			filename             sql.NullString
 		}
 		var msgs []rawMsg
 		for msgRows.Next() {
@@ -366,7 +450,7 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 				ctxMsgs[k] = contextMsg{
 					Sender:         m.sender,
 					FullName:       m.fullName,
-					Content:        m.content,
+					Content:        m.content.String,
 					Timestamp:      m.timestamp,
 					ReplyToContent: m.replyToContent.String,
 				}
@@ -388,23 +472,9 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 
 		emitDocs(chatDocs)
 		indexed += len(msgs)
-
-		now := time.Now()
-		elapsed := now.Sub(lastReport).Seconds()
-		if elapsed > 0 {
-			chatMsgsPerSec := float64(indexed-lastReportIdx) / elapsed
-			totalElapsed := now.Sub(startTime).Seconds()
-			overallRate := float64(indexed) / totalElapsed
-			avgTok := 0.0
-			if store.embedder != nil {
-				avgTok = store.embedder.AvgTokens()
-			}
-			logger.Debugf("Re-indexed %d/%d messages (%d contexts) | chat: %.0f msg/s | overall: %.0f msg/s | elapsed: %.1fs | avg tokens/msg: %.1f",
-				indexed, total, groups, chatMsgsPerSec, overallRate, totalElapsed, avgTok)
-		}
-		lastReport = now
-		lastReportIdx = indexed
+		_ = bar.Add(len(msgs))
 	}
+	_ = bar.Finish()
 
 	totalElapsed := time.Since(startTime).Seconds()
 	overallRate := 0.0
@@ -425,37 +495,60 @@ type rescoredHit struct {
 // searchMessages performs a hybrid text + vector search using bleve's score
 // fusion, then applies custom rescoring (mute penalty, user-ratio boost) and
 // returns one SearchResult per matched context group.
-func searchMessages(store *MessageStore, queryStr string, chatJID string, limit int, semanticWeight float64) ([]SearchResult, error) {
-	logger.Debugf("Searching for \"%s\" (chatJID=%s, limit=%d, offset=%d)", queryStr, chatJID, limit)
+func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int) ([]SearchResult, error) {
+	logger.Debugf("Searching for \"%s\" (chatJID=%v, limit=%d, offset=%d)", queryStr, chatJIDs, limit)
 
-	// Main query
+	// Main query — target the context field so bleve uses pt_ascii to analyze
+	// the query, matching the analyzer used at index time.
 	matchQuery := bleve.NewMatchQuery(queryStr)
+	matchQuery.SetField("context")
 	matchQuery.SetBoost(1.0 - semanticWeight)
 
 	// Build text query.
-	var textQuery query.Query
+	var searchQuery query.Query
 	var fetchSize int
-	if chatJID != "" {
-		chatTermQuery := bleve.NewTermQuery(chatJID)
-		chatTermQuery.SetField("chat_jid")
+	if len(chatJIDs) > 0 {
+		// Match chat JIDs
 		booleanQuery := bleve.NewBooleanQuery()
+		for _, jid := range chatJIDs {
+			chatTermQuery := bleve.NewTermQuery(jid)
+			chatTermQuery.SetField("chat_jid")
+			booleanQuery.AddMust(chatTermQuery)
+		}
+		// Text query
 		booleanQuery.AddMust(matchQuery)
-		booleanQuery.AddMust(chatTermQuery)
-		textQuery = booleanQuery
-		fetchSize = limit
+		searchQuery = booleanQuery
+		expandFactor := len(chatJIDs)
+		if expandFactor > 5 {
+			expandFactor = 5
+		}
+		fetchSize = limit * expandFactor
 	} else {
-		textQuery = matchQuery
+		searchQuery = matchQuery
 		fetchSize = limit * 5 // Increase fecth size for open search to compensate for deduplication and filtering
 	}
 
+	// Add filter for daysSince if specified, by creating a new bleve.NewDateRangeQuery()
+	if daysSince > 0 {
+		today := time.Now()
+		sinceTime := today.Add(-time.Duration(daysSince) * 24 * time.Hour)
+		dateQuery := bleve.NewDateRangeQuery(sinceTime, today)
+		dateQuery.SetField("timestamp_last")
+		booleanQuery := bleve.NewBooleanQuery()
+		booleanQuery.AddMust(searchQuery)
+		booleanQuery.AddMust(dateQuery)
+		searchQuery = booleanQuery
+	}
+
 	// Over-fetch to compensate for deduplication.
-	searchRequest := bleve.NewSearchRequest(textQuery)
+	searchRequest := bleve.NewSearchRequest(searchQuery)
 	searchRequest.Size = fetchSize
 	searchRequest.From = 0
-	searchRequest.SortBy([]string{"-_score", "-timestamp_last"})
+	searchRequest.SortBy([]string{"-_score"})
+	//searchRequest.Fields = []string{"title", "content"}
 
 	// Add kNN vector query if embedder is available.
-	if store.embedder != nil {
+	if store.embedder != nil && semanticWeight > 0.0 {
 		if text := sanitizeForEmbedding(queryStr); text != "" {
 			queryVec, err := store.embedder.Embed(text)
 			if err != nil {
@@ -470,13 +563,16 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 	}
 
 	params := bleve.RequestParams{
-		ScoreWindowSize: fetchSize,
+		ScoreWindowSize: fetchSize * 5,
 	}
 	searchRequest.AddParams(params)
 
 	logger.Debugf("searchRequest = %+v", searchRequest)
 
 	searchResult, err := store.index.Search(searchRequest)
+
+	logger.Debugf("searchResult = %+v (err=%v)", searchResult, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +601,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 		// Mute penalty.
 		muted, err := store.IsChatMuted(hitChatJID)
 		if err == nil && muted {
-			hit.Score *= 0.1
+			//	hit.Score *= 0.1
 		}
 
 		// User message ratio boost.
@@ -517,7 +613,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 			}
 			chatRatios[hitChatJID] = ratio
 		}
-		hit.Score *= (1.0 + ratio)
+		// hit.Score *= (1.0 + ratio)
 
 		hits = append(hits, rescoredHit{
 			chatJID: hitChatJID,
@@ -538,7 +634,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJID string, limit 
 	var results []SearchResult
 	for _, h := range hits {
 		msgRows, err := store.db.Query(
-			`SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename
+			`SELECT sender, full_name, COALESCE(content, ''), timestamp, is_from_me, COALESCE(media_type, ''), COALESCE(filename, '')
 			 FROM messages
 			 WHERE chat_jid = ? AND (content != '' OR media_type != '')
 			 ORDER BY timestamp LIMIT ? OFFSET ?`,
@@ -588,36 +684,6 @@ func deleteIndex() error {
 // CustomRescorer implements custom scoring for search results.
 type CustomRescorer struct {
 	store *MessageStore
-}
-
-// Rescore applies custom scoring logic.
-func (r *CustomRescorer) Rescore(ctx context.Context, searchResult *bleve.SearchResult) error {
-	chatRatios := make(map[string]float64)
-
-	for _, hit := range searchResult.Hits {
-		parts := strings.SplitN(hit.ID, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		chatJID := parts[0]
-
-		muted, err := r.store.IsChatMuted(chatJID)
-		if err == nil && muted {
-			hit.Score *= 0.1
-		}
-
-		ratio, exists := chatRatios[chatJID]
-		if !exists {
-			ratio, err = r.calculateUserMessageRatio(chatJID)
-			if err != nil {
-				ratio = 0.5
-			}
-			chatRatios[chatJID] = ratio
-		}
-		hit.Score *= (1.0 + ratio)
-	}
-
-	return nil
 }
 
 func (r *CustomRescorer) calculateUserMessageRatio(chatJID string) (float64, error) {

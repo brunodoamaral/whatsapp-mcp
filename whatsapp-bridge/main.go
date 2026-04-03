@@ -176,12 +176,16 @@ func main() {
 		}
 	}()
 
+	broadcaster := NewMessageBroadcaster()
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
-			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			// Process regular messages and broadcast to WebSocket subscribers
+			if bm := handleMessage(client, messageStore, v, logger); bm != nil {
+				broadcaster.Broadcast(*bm)
+			}
 
 		case *events.Contact:
 			tracef("Syncing Contacts!")
@@ -295,7 +299,7 @@ func main() {
 	logger.Infof("Connected to WhatsApp!")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, broadcaster, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
