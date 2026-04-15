@@ -117,6 +117,11 @@ func init() {
 
 const contextNumMessages = 16 // messages per indexed context group
 
+// debugLogContext logs a context group at DEBUG level (no-op when logger is above DEBUG).
+func debugLogContext(chatJID string, group int, ctxStr string) {
+	logger.Debugf("--- %s group %d ---\n%s", chatJID, group, ctxStr)
+}
+
 // formatContextWindow builds a context string from a slice of messages.
 func formatContextWindow(msgs []contextMsg) string {
 	var b strings.Builder
@@ -212,10 +217,27 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 		groupSize := messageJIDOrder - groupStart + 1
 
 		// Fetch all messages in the current group from SQLite.
+		// CTEs materialise contact names and best stored sender names once,
+		// then the main query joins them — avoiding per-row correlated subqueries.
 		groupRows, err := db.Query(`
-			SELECT m.sender, m.full_name, m.content, m.timestamp, r.content
+			WITH contact_names AS (
+			    SELECT their_jid,
+			           COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,'')) AS display_name
+			    FROM wdb.whatsmeow_contacts
+			),
+			sender_names AS (
+			    SELECT sender, full_name AS display_name
+			    FROM messages
+			    WHERE full_name != '' AND full_name != sender
+			    GROUP BY sender
+			)
+			SELECT m.sender,
+			       COALESCE(cn.display_name, sn.display_name, m.full_name),
+			       m.content, m.timestamp, r.content
 			FROM messages m
 			LEFT JOIN messages r ON m.reply_to_id = r.id
+			LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
+			LEFT JOIN sender_names sn ON sn.sender = m.sender
 			WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
 			ORDER BY m.timestamp LIMIT ? OFFSET ?`,
 			chatJID, groupSize, groupStart,
@@ -234,6 +256,7 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 	}
 
 	ctxStr := formatContextWindow(groupMsgs)
+	debugLogContext(chatJID, group, ctxStr)
 	embText := ctxStr
 	if embText == "" {
 		embText = content
@@ -279,22 +302,46 @@ const (
 // embBatch is defined in embedding.go
 )
 
-// reIndexAllMessages re-indexes every message from the database into bleve
-// using batch ONNX inference (embBatch texts per call) and bleve batch inserts.
-// Messages are processed per chat_jid and grouped into fixed-size windows of
-// contextNumMessages, producing one bleve document per group (doc ID: chatJID:groupNumber).
-func reIndexAllMessages(store *MessageStore, maxRows int) error {
-	logger.Infof("Starting re-indexing of all messages...")
-
-	// Skip if index already populated.
-	count, err := store.index.DocCount()
-	if err == nil && count > 0 {
-		logger.Infof("Index already has %d documents, skipping re-index", count)
-		return nil
+// reIndexAllMessages re-indexes messages from the database into bleve.
+// When chatFilter is non-empty, only chats whose JID contains the filter string
+// (case-insensitive LIKE match) are processed, existing bleve docs for those
+// chats are deleted first, and the global "already populated" skip is bypassed.
+func reIndexAllMessages(store *MessageStore, maxRows int, chatFilter string) error {
+	if chatFilter != "" {
+		logger.Infof("Starting re-indexing for chats matching %q...", chatFilter)
+	} else {
+		logger.Infof("Starting re-indexing of all messages...")
 	}
 
+	// Skip if index already populated — only for full reindex.
+	if chatFilter == "" {
+		count, err := store.index.DocCount()
+		if err == nil && count > 0 {
+			logger.Infof("Index already has %d documents, skipping re-index", count)
+			return nil
+		}
+	}
+
+	// When a plain phone number is given as filter, anchor it before the '@' so
+	// that legacy group JIDs like "5521992125269-1462706974@g.us" (where the
+	// creator's number is embedded in the JID) do not match.
+	likeFilter := ""
+	if chatFilter != "" {
+		if strings.Contains(chatFilter, "@") {
+			likeFilter = "%" + chatFilter + "%"
+		} else {
+			likeFilter = "%" + chatFilter + "@%"
+		}
+	}
+
+	countQuery := `SELECT COUNT(*) FROM messages WHERE (content != '' OR media_type != '')`
+	var countArgs []interface{}
+	if likeFilter != "" {
+		countQuery = `SELECT COUNT(*) FROM messages WHERE (content != '' OR media_type != '') AND chat_jid LIKE ?`
+		countArgs = append(countArgs, likeFilter)
+	}
 	var total int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE (content != '' OR media_type != '')`).Scan(&total); err != nil {
+	if err := store.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		logger.Warnf("Could not count messages: %v", err)
 	}
 	if maxRows > 0 && total > maxRows {
@@ -373,10 +420,14 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 		groups += len(docs)
 	}
 
-	// Get all chat_jids with indexable messages.
-	chatRows, err := store.db.Query(
-		`SELECT DISTINCT chat_jid FROM messages WHERE (content != '' OR media_type != '')`,
-	)
+	// Get chat_jids with indexable messages, optionally filtered.
+	chatQuery := `SELECT DISTINCT chat_jid FROM messages WHERE (content != '' OR media_type != '')`
+	var chatArgs []interface{}
+	if likeFilter != "" {
+		chatQuery += ` AND chat_jid LIKE ?`
+		chatArgs = append(chatArgs, likeFilter)
+	}
+	chatRows, err := store.db.Query(chatQuery, chatArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to query chat_jids: %v", err)
 	}
@@ -389,16 +440,34 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 	}
 	chatRows.Close()
 
+
 	for _, jid := range chatJIDs {
 		if maxRows > 0 && indexed >= maxRows {
 			break
 		}
 
 		// Load all messages for this chat.
+		// CTEs materialise contact names and best stored sender names once,
+		// then the main query joins them — avoiding per-row correlated subqueries.
 		msgRows, err := store.db.Query(`
-				SELECT m.id, m.sender, m.full_name, m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
+				WITH contact_names AS (
+				    SELECT their_jid,
+				           COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,'')) AS display_name
+				    FROM wdb.whatsmeow_contacts
+				),
+				sender_names AS (
+				    SELECT sender, full_name AS display_name
+				    FROM messages
+				    WHERE full_name != '' AND full_name != sender
+				    GROUP BY sender
+				)
+				SELECT m.id, m.sender,
+				       COALESCE(cn.display_name, sn.display_name, m.full_name),
+				       m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
 				FROM messages m
 				LEFT JOIN messages r ON m.reply_to_id = r.id
+				LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
+				LEFT JOIN sender_names sn ON sn.sender = m.sender
 				WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
 				ORDER BY m.timestamp
 			`, jid)
@@ -456,6 +525,10 @@ func reIndexAllMessages(store *MessageStore, maxRows int) error {
 				}
 			}
 			ctxStr := formatContextWindow(ctxMsgs)
+
+			if chatFilter != "" {
+				debugLogContext(jid, i/contextNumMessages, ctxStr)
+			}
 
 			r := reindexRow{
 				group: i / contextNumMessages,
@@ -634,10 +707,25 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 	var results []SearchResult
 	for _, h := range hits {
 		msgRows, err := store.db.Query(
-			`SELECT sender, full_name, COALESCE(content, ''), timestamp, is_from_me, COALESCE(media_type, ''), COALESCE(filename, '')
-			 FROM messages
-			 WHERE chat_jid = ? AND (content != '' OR media_type != '')
-			 ORDER BY timestamp LIMIT ? OFFSET ?`,
+			`WITH contact_names AS (
+			     SELECT their_jid,
+			            COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,'')) AS display_name
+			     FROM wdb.whatsmeow_contacts
+			 ),
+			 sender_names AS (
+			     SELECT sender, full_name AS display_name
+			     FROM messages
+			     WHERE full_name != '' AND full_name != sender
+			     GROUP BY sender
+			 )
+			 SELECT m.sender,
+			        COALESCE(cn.display_name, sn.display_name, m.full_name),
+			        COALESCE(m.content, ''), m.timestamp, m.is_from_me, COALESCE(m.media_type, ''), COALESCE(m.filename, '')
+			 FROM messages m
+			 LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
+			 LEFT JOIN sender_names sn ON sn.sender = m.sender
+			 WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
+			 ORDER BY m.timestamp LIMIT ? OFFSET ?`,
 			h.chatJID, contextNumMessages, h.group*contextNumMessages,
 		)
 		if err != nil {

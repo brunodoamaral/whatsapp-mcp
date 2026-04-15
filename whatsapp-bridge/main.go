@@ -48,12 +48,12 @@ func main() {
 	}
 	logger = waLog.Stdout("Client", logLevel, true)
 
-	reindex := flag.Bool("reindex", false, "delete and rebuild the search index, then exit")
+	reindex := flag.String("reindex", "", `rebuild the search index then exit; use "all" to reindex everything, or a partial JID/phone to reindex only matching chats`)
 	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file (use with --reindex)")
 	maxRows := flag.Int("max-rows", 0, "limit rows processed during --reindex (0 = unlimited, useful with --cpuprofile)")
 	flag.Parse()
 
-	if *reindex {
+	if *reindex != "" {
 		var profFile *os.File
 		stopProfile := func() {
 			if profFile != nil {
@@ -87,11 +87,17 @@ func main() {
 			}()
 		}
 
-		logger.Infof("--reindex: deleting existing index at %s", indexPath)
-		if err := deleteIndex(); err != nil {
-			logger.Errorf("Failed to delete index: %v", err)
-			stopProfile()
-			os.Exit(1)
+		chatFilter := *reindex
+		if chatFilter == "all" {
+			chatFilter = ""
+			logger.Infof("--reindex all: deleting existing index at %s", indexPath)
+			if err := deleteIndex(); err != nil {
+				logger.Errorf("Failed to delete index: %v", err)
+				stopProfile()
+				os.Exit(1)
+			}
+		} else {
+			logger.Infof("--reindex %q: reindexing matching chats only", chatFilter)
 		}
 		messageStore, err := NewMessageStore()
 		if err != nil {
@@ -99,7 +105,7 @@ func main() {
 			stopProfile()
 			os.Exit(1)
 		}
-		if err := messageStore.ReIndexAllMessages(*maxRows); err != nil {
+		if err := messageStore.ReIndexAllMessages(*maxRows, chatFilter); err != nil {
 			logger.Errorf("Re-indexing failed: %v", err)
 			messageStore.Close()
 			stopProfile()
@@ -170,7 +176,7 @@ func main() {
 
 	// Re-index existing messages
 	go func() {
-		err := messageStore.ReIndexAllMessages(0)
+		err := messageStore.ReIndexAllMessages(0, "")
 		if err != nil {
 			logger.Errorf("Failed to re-index messages: %v", err)
 		}

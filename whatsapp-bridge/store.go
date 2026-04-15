@@ -41,6 +41,18 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)    // keep the single connection alive so ATTACH persists
+	db.SetConnMaxLifetime(0) // never expire the connection
+
+	// Attach whatsapp.db (read-only) so queries can resolve contact names from whatsmeow_contacts.
+	if _, attachErr := db.Exec(`ATTACH DATABASE 'file:store/whatsapp.db?mode=ro' AS wdb`); attachErr != nil {
+		fmt.Printf("Warning: could not attach whatsapp.db for contact name lookup: %v\n", attachErr)
+	}
+
+	// Performance pragmas: memory-mapped I/O reduces disk overhead for large scans;
+	// temp_store keeps CTE materialisation and sort buffers in RAM.
+	_, _ = db.Exec(`PRAGMA mmap_size = 2147483648`)
+	_, _ = db.Exec(`PRAGMA temp_store = MEMORY`)
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (
@@ -247,8 +259,9 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 }
 
 // ReIndexAllMessages delegates to the search module.
-func (store *MessageStore) ReIndexAllMessages(maxRows int) error {
-	return reIndexAllMessages(store, maxRows)
+// chatFilter is an optional partial JID string; pass "" to reindex everything.
+func (store *MessageStore) ReIndexAllMessages(maxRows int, chatFilter string) error {
+	return reIndexAllMessages(store, maxRows, chatFilter)
 }
 
 // GetChatNameByJID returns the stored name for a chat, or "" if not found.
