@@ -5,10 +5,10 @@ go 1.25.0
 require (
 	github.com/blevesearch/bleve/v2 v2.5.8-0.20260326152045-6b72a249e566
 	github.com/gomlx/go-huggingface v0.3.4
-	github.com/mattn/go-sqlite3 v1.14.33
+	github.com/mattn/go-sqlite3 v1.14.34
 	github.com/mdp/qrterminal v1.0.1
 	github.com/yalue/onnxruntime_go v1.27.0
-	go.mau.fi/whatsmeow v0.0.0-20260129212019-7787ab952245
+	go.mau.fi/whatsmeow v0.0.0-20260414172242-d4ffc1df2442
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -16,7 +16,7 @@ require (
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/schollz/progressbar/v3 v3.19.0 // indirect
-	golang.org/x/term v0.39.0 // indirect
+	golang.org/x/term v0.40.0 // indirect
 )
 
 replace github.com/gomlx/go-huggingface => github.com/brunodoamaral/go-huggingface v0.0.0-20260326213707-a8e8f038097d
@@ -62,10 +62,10 @@ require (
 	github.com/vektah/gqlparser/v2 v2.5.31 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
 	go.mau.fi/libsignal v0.2.1 // indirect
-	go.mau.fi/util v0.9.5 // indirect
-	golang.org/x/crypto v0.47.0 // indirect
+	go.mau.fi/util v0.9.6 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
-	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	rsc.io/qr v0.2.0 // indirect

@@ -635,17 +635,19 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 		logger.Debugf("Not using embedder for this query")
 	}
 
-	params := bleve.RequestParams{
-		ScoreWindowSize: fetchSize * 5,
+	// ScoreWindowSize is only needed for KNN/hybrid RSF scoring.
+	// Applying it for pure FTS forces bleve to scan a huge candidate window
+	// and makes queries an order of magnitude slower.
+	if store.embedder != nil && semanticWeight > 0.0 {
+		params := bleve.RequestParams{
+			ScoreWindowSize: fetchSize * 5,
+		}
+		searchRequest.AddParams(params)
 	}
-	searchRequest.AddParams(params)
 
 	logger.Debugf("searchRequest = %+v", searchRequest)
 
 	searchResult, err := store.index.Search(searchRequest)
-
-	logger.Debugf("searchResult = %+v (err=%v)", searchResult, err)
-
 	if err != nil {
 		return nil, err
 	}
@@ -707,23 +709,15 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 	var results []SearchResult
 	for _, h := range hits {
 		msgRows, err := store.db.Query(
-			`WITH contact_names AS (
-			     SELECT their_jid,
-			            COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,'')) AS display_name
-			     FROM wdb.whatsmeow_contacts
-			 ),
-			 sender_names AS (
-			     SELECT sender, full_name AS display_name
-			     FROM messages
-			     WHERE full_name != '' AND full_name != sender
-			     GROUP BY sender
-			 )
-			 SELECT m.sender,
-			        COALESCE(cn.display_name, sn.display_name, m.full_name),
+			`SELECT m.sender,
+			        COALESCE(
+			            (SELECT COALESCE(NULLIF(c.full_name,''), NULLIF(c.first_name,''), NULLIF(c.push_name,''))
+			             FROM wdb.whatsmeow_contacts c
+			             WHERE c.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END),
+			            m.full_name
+			        ),
 			        COALESCE(m.content, ''), m.timestamp, m.is_from_me, COALESCE(m.media_type, ''), COALESCE(m.filename, '')
 			 FROM messages m
-			 LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
-			 LEFT JOIN sender_names sn ON sn.sender = m.sender
 			 WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
 			 ORDER BY m.timestamp LIMIT ? OFFSET ?`,
 			h.chatJID, contextNumMessages, h.group*contextNumMessages,
