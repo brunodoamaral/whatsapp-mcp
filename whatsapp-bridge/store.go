@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"time"
+	"strings"
 
 	"github.com/blevesearch/bleve/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -364,16 +365,39 @@ func (store *MessageStore) GetMessagesFiltered(chatJID string, f MessageFilter) 
 // GetAllMessagesSince returns all messages across all chats with timestamp
 // strictly after `since`, ordered oldest-first, as BroadcastMessages ready
 // for WS catch-up delivery.
-func (store *MessageStore) GetAllMessagesSince(since time.Time) ([]BroadcastMessage, error) {
-	rows, err := store.db.Query(`
-		SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
-		       m.sender, m.full_name, m.content, m.timestamp,
-		       m.is_from_me, m.media_type, m.filename, m.reply_to_id
-		FROM messages m
-		LEFT JOIN chats c ON c.jid = m.chat_jid
-		WHERE m.timestamp > ?
-		ORDER BY m.timestamp ASC`,
-		since)
+func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []string) ([]BroadcastMessage, error) {
+	rows, err := func() (*sql.Rows, error) {
+		if len(chatJIDs) > 0 {
+			placeholders := make([]string, len(chatJIDs))
+			args := make([]interface{}, len(chatJIDs)+1)
+			for i, jid := range chatJIDs {
+				placeholders[i] = "?"
+				args[i] = jid
+			}
+			args[len(chatJIDs)] = since
+
+			query := fmt.Sprintf(`
+				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
+					m.sender, m.full_name, m.content, m.timestamp,
+					m.is_from_me, m.media_type, m.filename, m.reply_to_id
+				FROM messages m
+				LEFT JOIN chats c ON c.jid = m.chat_jid
+				WHERE m.chat_jid IN (%s) AND m.timestamp > ?
+				ORDER BY m.timestamp ASC`, strings.Join(placeholders, ","))
+			return store.db.Query(query, args...)
+		} else {
+			return store.db.Query(`
+				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
+					m.sender, m.full_name, m.content, m.timestamp,
+					m.is_from_me, m.media_type, m.filename, m.reply_to_id
+				FROM messages m
+				LEFT JOIN chats c ON c.jid = m.chat_jid
+				WHERE m.timestamp > ?
+				ORDER BY m.timestamp ASC`,
+				since)
+		}
+	}()
+
 	if err != nil {
 		return nil, err
 	}

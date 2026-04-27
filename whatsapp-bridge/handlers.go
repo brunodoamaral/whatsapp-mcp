@@ -321,6 +321,18 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 			return
 		}
 
+		channelsStr := r.URL.Query().Get("jids")
+
+		// Split by , trim whitespace, and filter out empty strings
+		var channels []string
+		if channelsStr != "" {
+			for _, c := range splitAndTrim(channelsStr, ",") {
+				if c != "" {
+					channels = append(channels, c)
+				}
+			}
+		}
+
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
 		})
@@ -333,7 +345,7 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 
 		// Catch-up: replay messages missed since last disconnect.
 		if lastSeen, ok := registry.GetLastSeen(clientName); ok {
-			missed, err := store.GetAllMessagesSince(lastSeen)
+			missed, err := store.GetAllMessagesSince(lastSeen, channels)
 			if err != nil {
 				logger.Warnf("WS catch-up query failed for client %q: %v", clientName, err)
 			} else {
