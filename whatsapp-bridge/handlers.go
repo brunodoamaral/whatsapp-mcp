@@ -38,7 +38,7 @@ func splitAndTrim(s, sep string) []string {
 }
 
 // startRESTServer initialises the chi router with all API routes and starts the server.
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broadcaster *MessageBroadcaster, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broadcaster *MessageBroadcaster, registry *ClientRegistry, port int) {
 	r := chi.NewRouter()
 
 	r.Post("/api/send", makeSendHandler(client))
@@ -46,7 +46,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broad
 	r.Get("/api/search", makeSearchHandler(messageStore))
 	r.Post("/api/chats/{jid}/mute", makeMuteHandler(messageStore))
 	r.Get("/api/chats/{jid}/messages", makeGetMessagesHandler(messageStore))
-	r.Get("/ws/messages", makeWSHandler(broadcaster))
+	r.Get("/ws/messages", makeWSHandler(broadcaster, registry, messageStore))
 
 	serverAddr := fmt.Sprintf(":%d", port)
 	logger.Infof("Starting REST API server on %s...", serverAddr)
@@ -296,8 +296,31 @@ func makeGetMessagesHandler(messageStore *MessageStore) http.HandlerFunc {
 	}
 }
 
-func makeWSHandler(broadcaster *MessageBroadcaster) http.HandlerFunc {
+// sendAndTrack marshals msg, writes it to conn, and updates the client registry.
+// Returns an error if writing fails.
+func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientRegistry, clientName string, msg BroadcastMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil // skip un-marshallable messages
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err = conn.Write(writeCtx, websocket.MessageText, data)
+	cancel()
+	if err != nil {
+		return err
+	}
+	_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
+	return nil
+}
+
+func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, store *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		clientName := r.URL.Query().Get("client_name")
+		if clientName == "" {
+			http.Error(w, "client_name query parameter is required", http.StatusBadRequest)
+			return
+		}
+
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
 		})
@@ -306,10 +329,25 @@ func makeWSHandler(broadcaster *MessageBroadcaster) http.HandlerFunc {
 		}
 		defer conn.CloseNow()
 
+		ctx := r.Context()
+
+		// Catch-up: replay messages missed since last disconnect.
+		if lastSeen, ok := registry.GetLastSeen(clientName); ok {
+			missed, err := store.GetAllMessagesSince(lastSeen)
+			if err != nil {
+				logger.Warnf("WS catch-up query failed for client %q: %v", clientName, err)
+			} else {
+				for _, msg := range missed {
+					if err := sendAndTrack(ctx, conn, registry, clientName, msg); err != nil {
+						return
+					}
+				}
+			}
+		}
+
 		ch := broadcaster.Subscribe()
 		defer broadcaster.Unsubscribe(ch)
 
-		ctx := r.Context()
 		for {
 			select {
 			case <-ctx.Done():
@@ -320,14 +358,7 @@ func makeWSHandler(broadcaster *MessageBroadcaster) http.HandlerFunc {
 					conn.Close(websocket.StatusNormalClosure, "broadcaster closed")
 					return
 				}
-				data, err := json.Marshal(msg)
-				if err != nil {
-					continue
-				}
-				writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				err = conn.Write(writeCtx, websocket.MessageText, data)
-				cancel()
-				if err != nil {
+				if err := sendAndTrack(ctx, conn, registry, clientName, msg); err != nil {
 					return
 				}
 			}

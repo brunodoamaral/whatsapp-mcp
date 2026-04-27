@@ -361,6 +361,48 @@ func (store *MessageStore) GetMessagesFiltered(chatJID string, f MessageFilter) 
 	return messages, nil
 }
 
+// GetAllMessagesSince returns all messages across all chats with timestamp
+// strictly after `since`, ordered oldest-first, as BroadcastMessages ready
+// for WS catch-up delivery.
+func (store *MessageStore) GetAllMessagesSince(since time.Time) ([]BroadcastMessage, error) {
+	rows, err := store.db.Query(`
+		SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
+		       m.sender, m.full_name, m.content, m.timestamp,
+		       m.is_from_me, m.media_type, m.filename, m.reply_to_id
+		FROM messages m
+		LEFT JOIN chats c ON c.jid = m.chat_jid
+		WHERE m.timestamp > ?
+		ORDER BY m.timestamp ASC`,
+		since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []BroadcastMessage
+	for rows.Next() {
+		var bm BroadcastMessage
+		var msg MessageWithID
+		var ts time.Time
+		var replyToID sql.NullString
+		err := rows.Scan(
+			&msg.ID, &bm.ChatJID, &bm.ChatName,
+			&msg.Sender, &msg.FullName, &msg.Content, &ts,
+			&msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		msg.Time = ts
+		if replyToID.Valid {
+			msg.ReplyToID = replyToID.String
+		}
+		bm.Message = msg
+		result = append(result, bm)
+	}
+	return result, nil
+}
+
 // SearchMessages delegates to the search module.
 func (store *MessageStore) SearchMessages(queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int) ([]SearchResult, error) {
 	return searchMessages(store, queryStr, chatJIDs, limit, semanticWeight, daysSince)

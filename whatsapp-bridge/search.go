@@ -184,6 +184,12 @@ func buildIndexMapping(embDim int) mapping.IndexMapping {
 
 	m.DefaultMapping.AddFieldMappingsAt("context", textFieldMapping)
 
+	// chat_jid must be indexed as a keyword (no analysis) so TermQuery can
+	// match the full JID string like "120363313357391553@g.us" as a single token.
+	keywordFieldMapping := bleve.NewTextFieldMapping()
+	keywordFieldMapping.Analyzer = "keyword"
+	m.DefaultMapping.AddFieldMappingsAt("chat_jid", keywordFieldMapping)
+
 	// Vector field for semantic search.
 	vectorFieldMapping := mapping.NewVectorFieldMapping()
 	vectorFieldMapping.Dims = embDim
@@ -581,13 +587,15 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 	var searchQuery query.Query
 	var fetchSize int
 	if len(chatJIDs) > 0 {
-		// Match chat JIDs
 		booleanQuery := bleve.NewBooleanQuery()
+		// Multiple JIDs must be OR'd (disjunction), then AND'd with the text query.
+		jidDisjunction := bleve.NewDisjunctionQuery()
 		for _, jid := range chatJIDs {
 			chatTermQuery := bleve.NewTermQuery(jid)
 			chatTermQuery.SetField("chat_jid")
-			booleanQuery.AddMust(chatTermQuery)
+			jidDisjunction.AddQuery(chatTermQuery)
 		}
+		booleanQuery.AddMust(jidDisjunction)
 		// Text query
 		booleanQuery.AddMust(matchQuery)
 		searchQuery = booleanQuery
@@ -672,6 +680,22 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 			continue
 		}
 		seen[hit.ID] = true
+
+		// Post-filter by chat_jid. This is the authoritative guard: KNN results
+		// bypass bleve's boolean-query MUST filters, so we enforce the constraint
+		// here using the JID embedded in the doc ID.
+		if len(chatJIDs) > 0 {
+			matched := false
+			for _, jid := range chatJIDs {
+				if hitChatJID == jid {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
 
 		// Mute penalty.
 		muted, err := store.IsChatMuted(hitChatJID)

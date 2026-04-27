@@ -184,6 +184,12 @@ func main() {
 
 	broadcaster := NewMessageBroadcaster()
 
+	registry, err := NewClientRegistry(messageStore.db)
+	if err != nil {
+		logger.Errorf("Failed to initialize client registry: %v", err)
+		return
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -305,7 +311,7 @@ func main() {
 	logger.Infof("Connected to WhatsApp!")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, broadcaster, 8080)
+	startRESTServer(client, messageStore, broadcaster, registry, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

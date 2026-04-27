@@ -1,6 +1,10 @@
 package main
 
-import "sync"
+import (
+	"database/sql"
+	"sync"
+	"time"
+)
 
 // BroadcastMessage is the payload sent to WebSocket subscribers for each
 // incoming WhatsApp message.
@@ -57,4 +61,69 @@ func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 		default:
 		}
 	}
+}
+
+// ClientRegistry persists the last message timestamp delivered to each named
+// WebSocket client. It survives server restarts via the shared SQLite database.
+type ClientRegistry struct {
+	db    *sql.DB
+	mu    sync.Mutex
+	cache map[string]time.Time // write-through cache
+}
+
+// NewClientRegistry creates the client_last_seen table if needed, loads all
+// existing rows into the in-memory cache, and returns a ready registry.
+func NewClientRegistry(db *sql.DB) (*ClientRegistry, error) {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS client_last_seen (
+			client_name TEXT PRIMARY KEY,
+			last_seen   TIMESTAMP NOT NULL
+		)`)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query("SELECT client_name, last_seen FROM client_last_seen")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cache := make(map[string]time.Time)
+	for rows.Next() {
+		var name string
+		var t time.Time
+		if err := rows.Scan(&name, &t); err != nil {
+			return nil, err
+		}
+		cache[name] = t
+	}
+
+	return &ClientRegistry{db: db, cache: cache}, nil
+}
+
+// GetLastSeen returns the last timestamp recorded for the given client name.
+// Returns false if the client has never connected before.
+func (r *ClientRegistry) GetLastSeen(name string) (time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.cache[name]
+	return t, ok
+}
+
+// UpdateLastSeen records t as the new last-seen timestamp for name, but only
+// if t is strictly after the current value. Writes through to SQLite.
+func (r *ClientRegistry) UpdateLastSeen(name string, t time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.cache[name]; ok && !t.After(existing) {
+		return nil
+	}
+	r.cache[name] = t
+	_, err := r.db.Exec(`
+		INSERT INTO client_last_seen (client_name, last_seen) VALUES (?, ?)
+		ON CONFLICT(client_name) DO UPDATE SET last_seen = excluded.last_seen
+		WHERE excluded.last_seen > client_last_seen.last_seen`,
+		name, t)
+	return err
 }
