@@ -20,6 +20,14 @@ POST /api/send
 
 `media_path` is optional. For groups use `@g.us` JIDs.
 
+Response:
+```json
+{
+  "success": true,
+  "message": "Message sent to 5511999999999@s.whatsapp.net"
+}
+```
+
 ---
 
 ## Download media
@@ -34,6 +42,18 @@ POST /api/download
   "chat_jid": "5511999999999@s.whatsapp.net"
 }
 ```
+
+Response:
+```json
+{
+  "success": true,
+  "message": "Successfully downloaded image media",
+  "filename": "image_20260101_120000.jpg",
+  "path": "/absolute/path/to/store/5511999999999_s.whatsapp.net/image_20260101_120000.jpg"
+}
+```
+
+Files are saved under `store/{chat_jid_colons_replaced}/` and cached (re-downloading the same message returns the existing file).
 
 ---
 
@@ -50,6 +70,34 @@ GET /api/search?q=hello&limit=10&days_since=30&chat_jid=...&semantic_weight=0.5
 | `days_since` | — | Restrict to last N days |
 | `chat_jid` | — | Comma-separated JIDs to filter |
 | `semantic_weight` | 0.5 | 0 = text only, 1 = semantic only |
+
+Results are grouped into context windows of up to 16 consecutive messages.
+
+Response:
+```json
+{
+  "query": "hello",
+  "total": 2,
+  "results": [
+    {
+      "chat_jid": "5511999999999@s.whatsapp.net",
+      "chat_name": "John",
+      "score": 0.95,
+      "messages": [
+        {
+          "sender": "5511999999999",
+          "full_name": "John",
+          "content": "Hello there!",
+          "time": "2026-01-01T12:00:00Z",
+          "is_from_me": false,
+          "media_type": "",
+          "filename": ""
+        }
+      ]
+    }
+  ]
+}
+```
 
 ---
 
@@ -85,11 +133,16 @@ Response:
       "sender": "5511999999999",
       "full_name": "John",
       "content": "Hello",
-      "is_from_me": false
+      "is_from_me": false,
+      "media_type": "image",
+      "filename": "photo.jpg",
+      "reply_to_id": "XYZ789"
     }
   ]
 }
 ```
+
+`media_type`, `filename`, and `reply_to_id` are omitted when empty.
 
 ---
 
@@ -103,13 +156,26 @@ POST /api/chats/{jid}/mute
 { "muted": true }
 ```
 
+Response:
+```json
+{
+  "success": true,
+  "message": "Chat 5511999999999@s.whatsapp.net muted status updated"
+}
+```
+
 ---
 
 ## Live messages (WebSocket)
 
 ```
-GET /ws/messages
+GET /ws/messages?client_name=my-app&jids=5511999999999@s.whatsapp.net,123456789@g.us
 ```
+
+| Param | Default | Description |
+|---|---|---|
+| `client_name` | required | Unique name for this client (used for catch-up tracking) |
+| `jids` | — | Comma-separated JIDs to filter (omit to receive all messages) |
 
 Connect with any WebSocket client. Each incoming WhatsApp message is pushed immediately as JSON:
 
@@ -132,6 +198,8 @@ Connect with any WebSocket client. Each incoming WhatsApp message is pushed imme
 ```
 
 `media_type`, `filename`, and `reply_to_id` are omitted when empty.
+
+**Catch-up:** On connect, the server replays all messages missed since this client's last disconnect (tracked by `client_name`). If `jids` is set, only messages matching those JIDs are replayed. This ensures clients never miss messages across restarts.
 
 ---
 

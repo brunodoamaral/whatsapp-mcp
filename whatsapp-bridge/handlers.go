@@ -296,9 +296,15 @@ func makeGetMessagesHandler(messageStore *MessageStore) http.HandlerFunc {
 	}
 }
 
-// sendAndTrack marshals msg, writes it to conn, and updates the client registry.
-// Returns an error if writing fails.
+// sendAndTrack sends a message and updates the client's last-seen timestamp.
 func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientRegistry, clientName string, msg BroadcastMessage) error {
+	_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
+	return sendToClient(ctx, conn, msg)
+}
+
+// sendToClient marshals msg and writes it to conn.
+// Returns an error if writing fails.
+func sendToClient(ctx context.Context, conn *websocket.Conn, msg BroadcastMessage) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return nil // skip un-marshallable messages
@@ -306,20 +312,18 @@ func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientReg
 	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	err = conn.Write(writeCtx, websocket.MessageText, data)
 	cancel()
-	if err != nil {
-		return err
-	}
-	_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
-	return nil
+	return err
 }
 
 func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, store *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		clientName := r.URL.Query().Get("client_name")
 		if clientName == "" {
+			logger.Warnf("WS reject: missing client_name from %s", r.RemoteAddr)
 			http.Error(w, "client_name query parameter is required", http.StatusBadRequest)
 			return
 		}
+		logger.Infof("WS connect attempt: client=%q remote=%s", clientName, r.RemoteAddr)
 
 		channelsStr := r.URL.Query().Get("jids")
 
@@ -332,47 +336,65 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				}
 			}
 		}
+		logger.Infof("WS parameters: client=%q jids=%v (%d channels)", clientName, channelsStr, len(channels))
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
 		})
 		if err != nil {
+			logger.Errorf("WS accept failed: client=%q err=%v", clientName, err)
 			return
 		}
 		defer conn.CloseNow()
+		logger.Infof("WS connected: client=%q", clientName)
 
 		ctx := r.Context()
 
 		// Catch-up: replay messages missed since last disconnect.
 		if lastSeen, ok := registry.GetLastSeen(clientName); ok {
+			logger.Infof("WS catch-up start: client=%q lastSeen=%s jids=%v", clientName, lastSeen, channels)
 			missed, err := store.GetAllMessagesSince(lastSeen, channels)
 			if err != nil {
 				logger.Warnf("WS catch-up query failed for client %q: %v", clientName, err)
 			} else {
+				logger.Infof("WS catch-up: client=%q replaying %d messages", clientName, len(missed))
 				for _, msg := range missed {
 					if err := sendAndTrack(ctx, conn, registry, clientName, msg); err != nil {
+						logger.Warnf("WS catch-up aborted: client=%q sendAndTrack error", clientName)
 						return
 					}
 				}
+				logger.Infof("WS catch-up complete: client=%q", clientName)
 			}
+		} else {
+			logger.Infof("WS catch-up skipped: client=%q (no lastSeen in registry)", clientName)
 		}
 
-		ch := broadcaster.Subscribe()
+		ch := broadcaster.Subscribe(channels)
 		defer broadcaster.Unsubscribe(ch)
+		logger.Infof("WS subscribed to broadcaster: client=%q channels=%v", clientName, channels)
 
 		for {
 			select {
 			case <-ctx.Done():
+				logger.Infof("WS disconnect: client=%q context done", clientName)
 				conn.Close(websocket.StatusNormalClosure, "client disconnected")
 				return
 			case msg, ok := <-ch:
 				if !ok {
+					logger.Warnf("WS broadcaster channel closed: client=%q", clientName)
 					conn.Close(websocket.StatusNormalClosure, "broadcaster closed")
 					return
 				}
-				if err := sendAndTrack(ctx, conn, registry, clientName, msg); err != nil {
+				// Always advance last-seen timestamp to avoid replaying
+				// already-seen but filtered messages on reconnect.
+				_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
+				logger.Debugf("WS received broadcast: client=%q chat=%q jid=%s id=%d", clientName, msg.ChatName, msg.ChatJID, msg.Message.ID)
+				if err := sendToClient(ctx, conn, msg); err != nil {
+					logger.Warnf("WS sendToClient error: client=%q chat=%q err=%v", clientName, msg.ChatName, err)
 					return
 				}
+				logger.Debugf("WS sent message: client=%q chat=%q", clientName, msg.ChatName)
 			}
 		}
 	}

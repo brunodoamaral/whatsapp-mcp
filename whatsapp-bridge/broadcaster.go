@@ -14,26 +14,34 @@ type BroadcastMessage struct {
 	Message  MessageWithID `json:"message"`
 }
 
+// subscriber holds a WebSocket client's channel and its JID filter.
+// An empty jids slice means no filtering — all messages are delivered.
+type subscriber struct {
+	ch   chan BroadcastMessage
+	jids []string
+}
+
 // MessageBroadcaster fan-outs incoming messages to all connected WebSocket
 // clients. It is safe for concurrent use.
 type MessageBroadcaster struct {
-	clients map[chan BroadcastMessage]struct{}
+	clients map[*subscriber]struct{}
 	mu      sync.RWMutex
 }
 
 // NewMessageBroadcaster creates an empty broadcaster.
 func NewMessageBroadcaster() *MessageBroadcaster {
 	return &MessageBroadcaster{
-		clients: make(map[chan BroadcastMessage]struct{}),
+		clients: make(map[*subscriber]struct{}),
 	}
 }
 
 // Subscribe registers a new subscriber and returns its receive channel.
+// If jids is non-empty, only messages matching those JIDs are delivered.
 // The caller must call Unsubscribe when done to avoid a goroutine/channel leak.
-func (b *MessageBroadcaster) Subscribe() chan BroadcastMessage {
+func (b *MessageBroadcaster) Subscribe(jids []string) chan BroadcastMessage {
 	ch := make(chan BroadcastMessage, 64)
 	b.mu.Lock()
-	b.clients[ch] = struct{}{}
+	b.clients[&subscriber{ch: ch, jids: jids}] = struct{}{}
 	b.mu.Unlock()
 	return ch
 }
@@ -44,9 +52,28 @@ func (b *MessageBroadcaster) Subscribe() chan BroadcastMessage {
 // already-closed channel.
 func (b *MessageBroadcaster) Unsubscribe(ch chan BroadcastMessage) {
 	b.mu.Lock()
-	delete(b.clients, ch)
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+	for sub := range b.clients {
+		if sub.ch == ch {
+			delete(b.clients, sub)
+			break
+		}
+	}
 	close(ch)
+}
+
+// jidMatches checks if msg.ChatJID matches any of the subscriber's JID filters.
+// If the subscriber has no filters (empty slice), all messages match.
+func (b *MessageBroadcaster) jidMatches(sub *subscriber, msg BroadcastMessage) bool {
+	if len(sub.jids) == 0 {
+		return true
+	}
+	for _, jid := range sub.jids {
+		if jid == msg.ChatJID {
+			return true
+		}
+	}
+	return false
 }
 
 // Broadcast delivers msg to all current subscribers. Sends are non-blocking:
@@ -55,12 +82,27 @@ func (b *MessageBroadcaster) Unsubscribe(ch chan BroadcastMessage) {
 func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	for ch := range b.clients {
+
+	subscriberCount := len(b.clients)
+	logger.Infof("Broadcast: chat=%q jid=%s subscribers=%d", msg.ChatName, msg.ChatJID, subscriberCount)
+
+	delivered := 0
+	dropped := 0
+	filtered := 0
+	for sub := range b.clients {
+		if !b.jidMatches(sub, msg) {
+			filtered++
+			continue
+		}
 		select {
-		case ch <- msg:
+		case sub.ch <- msg:
+			delivered++
 		default:
+			dropped++
+			logger.Warnf("Broadcast dropped: chat=%q subscriber buffer full", msg.ChatName)
 		}
 	}
+	logger.Infof("Broadcast done: chat=%q delivered=%d dropped=%d filtered=%d", msg.ChatName, delivered, dropped, filtered)
 }
 
 // ClientRegistry persists the last message timestamp delivered to each named
