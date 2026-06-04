@@ -146,6 +146,41 @@ Response:
 
 ---
 
+## Profile picture
+
+```
+GET /api/contacts/{jid}/profile-picture
+```
+
+| Param | Default | Description |
+|---|---|---|
+| `preview` | false | Return low-res thumbnail instead of full picture |
+| `is_community` | false | Required for community group photos (avoids 401) |
+| `known_id` | — | Last known picture ID; if unchanged, returns `changed: false` |
+
+Example:
+```
+GET /api/contacts/5511999999999@s.whatsapp.net/profile-picture
+GET /api/contacts/5511999999999@s.whatsapp.net/profile-picture?known_id=abc123&preview=true
+```
+
+Response (picture available or changed):
+```json
+{
+  "changed": true,
+  "id": "abc123",
+  "url": "https://pps.whatsapp.net/v/...",
+  "type": "image"
+}
+```
+
+Response (unchanged, `known_id` matched the current picture):
+```json
+{ "changed": false }
+```
+
+---
+
 ## Mute chat
 
 ```

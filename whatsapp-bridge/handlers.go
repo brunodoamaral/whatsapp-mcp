@@ -12,6 +12,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // MessageWithID is a Message enriched with its database primary key, used for
@@ -46,6 +47,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broad
 	r.Get("/api/search", makeSearchHandler(messageStore))
 	r.Post("/api/chats/{jid}/mute", makeMuteHandler(messageStore))
 	r.Get("/api/chats/{jid}/messages", makeGetMessagesHandler(messageStore))
+	r.Get("/api/contacts/{jid}/profile-picture", makeGetProfilePictureHandler(client))
 	r.Get("/ws/messages", makeWSHandler(broadcaster, registry, messageStore))
 
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -292,6 +294,51 @@ func makeGetMessagesHandler(messageStore *MessageStore) http.HandlerFunc {
 			"chat_jid": chatJID,
 			"messages": messages,
 			"count":    len(messages),
+		})
+	}
+}
+
+func makeGetProfilePictureHandler(client *whatsmeow.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		jidStr := chi.URLParam(r, "jid")
+		if jidStr == "" {
+			http.Error(w, "JID required", http.StatusBadRequest)
+			return
+		}
+
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		params := &whatsmeow.GetProfilePictureParams{
+			Preview:     r.URL.Query().Get("preview") == "true",
+			IsCommunity: r.URL.Query().Get("is_community") == "true",
+		}
+		if knownID := r.URL.Query().Get("known_id"); knownID != "" {
+			params.ExistingID = knownID
+		}
+
+		info, err := client.GetProfilePictureInfo(r.Context(), jid, params)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get profile picture: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if info == nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"changed": false,
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"changed": true,
+			"id":      info.ID,
+			"url":     info.URL,
+			"type":    info.Type,
 		})
 	}
 }
