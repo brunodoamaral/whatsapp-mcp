@@ -252,13 +252,31 @@ func (e *Embedder) getSession(seqLen int) (*sessionEntry, error) {
 		return nil, fmt.Errorf("create output tensor: %w", err)
 	}
 
+	// Cap ONNX threads. By default ORT creates a fresh intra-op thread pool
+	// sized to the CPU count for every session, and we cache one session per
+	// seqLen bucket, so the pools multiply. Embedding here is small batches on
+	// a low-core box, so single-threaded sequential execution is plenty and
+	// keeps the OS thread count flat.
+	opts, err := ort.NewSessionOptions()
+	if err != nil {
+		s.inIDs.Destroy()
+		s.inMask.Destroy()
+		s.inTypes.Destroy()
+		s.outTensor.Destroy()
+		return nil, fmt.Errorf("create ORT session options: %w", err)
+	}
+	defer opts.Destroy()
+	opts.SetIntraOpNumThreads(1)
+	opts.SetInterOpNumThreads(1)
+	opts.SetExecutionMode(ort.ExecutionModeSequential)
+
 	s.session, err = ort.NewAdvancedSession(
 		e.onnxPath,
 		e.inputNames,
 		[]string{chosenOutInfo.Name},
 		sessionInputs,
 		[]ort.ArbitraryTensor{s.outTensor},
-		nil,
+		opts,
 	)
 	if err != nil {
 		s.inIDs.Destroy()
