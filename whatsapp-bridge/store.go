@@ -187,11 +187,11 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, error) {
 	var msg Message
 	var timestamp time.Time
-	var replyToID sql.NullString
+	var mediaType, filename, replyToID sql.NullString
 	err := store.db.QueryRow(
 		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE id = ? AND chat_jid = ?",
 		id, chatJID,
-	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
+	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &mediaType, &filename, &replyToID)
 
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -201,6 +201,12 @@ func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, erro
 	}
 
 	msg.Time = timestamp
+	if mediaType.Valid {
+		msg.MediaType = mediaType.String
+	}
+	if filename.Valid {
+		msg.Filename = filename.String
+	}
 	if replyToID.Valid {
 		msg.ReplyToID = replyToID.String
 	}
@@ -222,12 +228,18 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	for rows.Next() {
 		var msg Message
 		var timestamp time.Time
-		var replyToID sql.NullString
-		err := rows.Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
+		var mediaType, filename, replyToID sql.NullString
+		err := rows.Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &mediaType, &filename, &replyToID)
 		if err != nil {
 			return nil, err
 		}
 		msg.Time = timestamp
+		if mediaType.Valid {
+			msg.MediaType = mediaType.String
+		}
+		if filename.Valid {
+			msg.Filename = filename.String
+		}
 		if replyToID.Valid {
 			msg.ReplyToID = replyToID.String
 		}
@@ -345,12 +357,18 @@ func (store *MessageStore) GetMessagesFiltered(chatJID string, f MessageFilter) 
 	for rows.Next() {
 		var msg MessageWithID
 		var timestamp time.Time
-		var replyToID sql.NullString
-		err := rows.Scan(&msg.ID, &msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID)
+		var mediaType, filename, replyToID sql.NullString
+		err := rows.Scan(&msg.ID, &msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &mediaType, &filename, &replyToID)
 		if err != nil {
 			return nil, err
 		}
 		msg.Time = timestamp
+		if mediaType.Valid {
+			msg.MediaType = mediaType.String
+		}
+		if filename.Valid {
+			msg.Filename = filename.String
+		}
 		if replyToID.Valid {
 			msg.ReplyToID = replyToID.String
 		}
@@ -408,16 +426,22 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 		var bm BroadcastMessage
 		var msg MessageWithID
 		var ts time.Time
-		var replyToID sql.NullString
+		var mediaType, filename, replyToID sql.NullString
 		err := rows.Scan(
 			&msg.ID, &bm.ChatJID, &bm.ChatName,
 			&msg.Sender, &msg.FullName, &msg.Content, &ts,
-			&msg.IsFromMe, &msg.MediaType, &msg.Filename, &replyToID,
+			&msg.IsFromMe, &mediaType, &filename, &replyToID,
 		)
 		if err != nil {
 			return nil, err
 		}
 		msg.Time = ts
+		if mediaType.Valid {
+			msg.MediaType = mediaType.String
+		}
+		if filename.Valid {
+			msg.Filename = filename.String
+		}
 		if replyToID.Valid {
 			msg.ReplyToID = replyToID.String
 		}
