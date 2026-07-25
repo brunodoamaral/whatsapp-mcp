@@ -33,6 +33,20 @@ type MessageStore struct {
 // NewMessageStore initialises the SQLite database, the bleve index (with vector
 // support when available), and the ONNX embedding model.
 func NewMessageStore() (*MessageStore, error) {
+	return newMessageStore(true)
+}
+
+// NewMessageStoreDBOnly opens just the SQLite database, leaving the bleve index
+// and the embedder uninitialised. bleve takes an exclusive lock on its index
+// directory, so this is what lets the transcription backfill run alongside the
+// live bridge instead of requiring it to be stopped. Only safe when the caller
+// does not touch the index — see --transcribe-backfill --skip-index, which is
+// meant to be followed by a full --reindex.
+func NewMessageStoreDBOnly() (*MessageStore, error) {
+	return newMessageStore(false)
+}
+
+func newMessageStore(withIndex bool) (*MessageStore, error) {
 	if err := os.MkdirAll("store", 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
@@ -92,6 +106,18 @@ func NewMessageStore() (*MessageStore, error) {
 
 	// Migration: add reply_to_id column to existing databases.
 	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN reply_to_id TEXT`)
+
+	// Migration: transcript_status tracks the voice-note transcription pipeline.
+	// NULL means "not applicable" (non-audio, or audio predating this column);
+	// see transcribe.go for the state machine. It doubles as the work queue, so
+	// it gets a partial index over the states the workers poll for.
+	_, _ = db.Exec(`ALTER TABLE messages ADD COLUMN transcript_status TEXT`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_transcript_status
+		ON messages(transcript_status) WHERE transcript_status IS NOT NULL`)
+
+	if !withIndex {
+		return &MessageStore{db: db}, nil
+	}
 
 	// Initialise embedder (best-effort — search still works text-only without it).
 	logger.Infof("Initialising embedding model...")
@@ -167,11 +193,24 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, fullName string, co
 		return nil
 	}
 
+	// INSERT OR REPLACE deletes and re-inserts the row, so a message redelivered
+	// by history sync would otherwise wipe a transcript that has already landed.
+	// Both content and transcript_status therefore fall back to the stored values
+	// when the incoming message carries no text of its own. A fresh voice note
+	// (audio, no caption) enters the pipeline as 'pending'.
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, fullName, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullableString(replyToID),
+		(id, chat_jid, sender, full_name, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, transcript_status)
+		VALUES (?, ?, ?, ?,
+			COALESCE(NULLIF(?, ''), (SELECT content FROM messages WHERE id = ? AND chat_jid = ?)),
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+			COALESCE((SELECT transcript_status FROM messages WHERE id = ? AND chat_jid = ?),
+			         CASE WHEN ? = 'audio' AND ? = '' THEN 'pending' END))`,
+		id, chatJID, sender, fullName,
+		content, id, chatJID,
+		timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, nullableString(replyToID),
+		id, chatJID,
+		mediaType, content,
 	)
 	if err != nil {
 		return err
@@ -189,7 +228,7 @@ func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, erro
 	var timestamp time.Time
 	var mediaType, filename, replyToID sql.NullString
 	err := store.db.QueryRow(
-		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT sender, COALESCE(full_name, ''), COALESCE(content, ''), timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE id = ? AND chat_jid = ?",
 		id, chatJID,
 	).Scan(&msg.Sender, &msg.FullName, &msg.Content, &timestamp, &msg.IsFromMe, &mediaType, &filename, &replyToID)
 
@@ -216,7 +255,7 @@ func (store *MessageStore) GetMessage(id string, chatJID string) (*Message, erro
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
-		"SELECT sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		"SELECT sender, COALESCE(full_name, ''), COALESCE(content, ''), timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
 		chatJID, limit,
 	)
 	if err != nil {
@@ -332,7 +371,7 @@ type MessageFilter struct {
 // GetMessagesFiltered returns messages for a chat with optional date range and
 // pagination. Results are ordered newest-first.
 func (store *MessageStore) GetMessagesFiltered(chatJID string, f MessageFilter) ([]MessageWithID, error) {
-	query := "SELECT id, sender, full_name, content, timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ?"
+	query := "SELECT id, sender, COALESCE(full_name, ''), COALESCE(content, ''), timestamp, is_from_me, media_type, filename, reply_to_id FROM messages WHERE chat_jid = ?"
 	args := []interface{}{chatJID}
 
 	if f.Start != nil {
@@ -396,7 +435,7 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 
 			query := fmt.Sprintf(`
 				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
-					m.sender, m.full_name, m.content, m.timestamp,
+					m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
 					m.is_from_me, m.media_type, m.filename, m.reply_to_id
 				FROM messages m
 				LEFT JOIN chats c ON c.jid = m.chat_jid
@@ -406,7 +445,7 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 		} else {
 			return store.db.Query(`
 				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
-					m.sender, m.full_name, m.content, m.timestamp,
+					m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
 					m.is_from_me, m.media_type, m.filename, m.reply_to_id
 				FROM messages m
 				LEFT JOIN chats c ON c.jid = m.chat_jid

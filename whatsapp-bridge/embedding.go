@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
@@ -61,7 +62,12 @@ type sessionEntry struct {
 }
 
 // Embedder wraps an ONNX sentence-transformer model for generating text embeddings.
+//
+// Not lock-free: the cached sessions own pre-allocated input/output tensors that
+// are overwritten on every call, so EmbedBatch serialises on mu. The transcription
+// worker embeds from its own goroutine while the event loop indexes new messages.
 type Embedder struct {
+	mu         sync.Mutex
 	tok        tokenizers.Tokenizer
 	onnxPath   string
 	inputNames []string
@@ -317,6 +323,9 @@ func (e *Embedder) EmbedBatch(texts []string) ([][]float32, error) {
 	if batchSize > embBatch {
 		return nil, fmt.Errorf("batch size %d exceeds session batch size %d", batchSize, embBatch)
 	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	// Tokenize all texts; find actual padLen for this batch.
 	tokenized := make([][]int64, batchSize)

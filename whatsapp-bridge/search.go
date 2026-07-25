@@ -238,14 +238,14 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 			    GROUP BY sender
 			)
 			SELECT m.sender,
-			       COALESCE(cn.display_name, sn.display_name, m.full_name),
-			       m.content, m.timestamp, r.content
+			       COALESCE(cn.display_name, sn.display_name, m.full_name, ''),
+			       COALESCE(m.content, ''), m.timestamp, COALESCE(r.content, '')
 			FROM messages m
-			LEFT JOIN messages r ON m.reply_to_id = r.id
+			LEFT JOIN messages r ON m.reply_to_id = r.id AND r.chat_jid = m.chat_jid
 			LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
 			LEFT JOIN sender_names sn ON sn.sender = m.sender
 			WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
-			ORDER BY m.timestamp LIMIT ? OFFSET ?`,
+			ORDER BY m.timestamp, m.id LIMIT ? OFFSET ?`,
 			chatJID, groupSize, groupStart,
 		)
 		if err != nil {
@@ -295,6 +295,107 @@ func indexMessage(index bleve.Index, embedder *Embedder, db *sql.DB, id, chatJID
 	if err := index.Index(docID, doc); err != nil {
 		logger.Warnf("Failed to index %s: %v", docID, err)
 	}
+}
+
+// groupIndexForMessage returns the 0-based context group a message belongs to,
+// using the same ordering as reIndexAllMessages (timestamp ascending over the
+// indexable messages of the chat).
+//
+// indexMessage derives the group from a plain COUNT(*), which only gives the
+// right answer for the newest message in a chat. Transcripts arrive minutes
+// after the voice note, by which time newer messages may exist, so the position
+// has to be computed from the message's own rank instead.
+// The target row's timestamp is read back from the database rather than bound
+// from Go: timestamps are stored as text with their original offset
+// ("2026-07-25 13:31:17-03:00"), and a bound time.Time serialises to a
+// different representation, so comparing the two lexically gives a wrong rank.
+// The (timestamp, id) tiebreak mirrors the ORDER BY used when building groups.
+func groupIndexForMessage(db *sql.DB, chatJID, id string) (int, error) {
+	var rank int
+	err := db.QueryRow(`
+		WITH target AS (
+		    SELECT timestamp AS ts, id AS tid FROM messages
+		    WHERE id = ? AND chat_jid = ?
+		)
+		SELECT COUNT(*) FROM messages, target
+		WHERE chat_jid = ? AND (content != '' OR media_type != '')
+		  AND (timestamp < ts OR (timestamp = ts AND id < tid))`,
+		id, chatJID, chatJID,
+	).Scan(&rank)
+	if err != nil {
+		return 0, err
+	}
+	return rank / contextNumMessages, nil
+}
+
+// rebuildGroupDoc re-reads one context group from SQLite and rewrites its bleve
+// document, re-embedding the group text. Used when a message's content changes
+// after it was first indexed (voice-note transcription).
+func rebuildGroupDoc(store *MessageStore, chatJID string, group int) error {
+	rows, err := store.db.Query(`
+		WITH contact_names AS (
+		    SELECT their_jid,
+		           COALESCE(NULLIF(full_name,''), NULLIF(first_name,''), NULLIF(push_name,'')) AS display_name
+		    FROM wdb.whatsmeow_contacts
+		),
+		sender_names AS (
+		    SELECT sender, full_name AS display_name
+		    FROM messages
+		    WHERE full_name != '' AND full_name != sender
+		    GROUP BY sender
+		)
+		SELECT m.sender,
+		       COALESCE(cn.display_name, sn.display_name, m.full_name, ''),
+		       COALESCE(m.content, ''), m.timestamp, COALESCE(r.content, '')
+		FROM messages m
+		LEFT JOIN messages r ON m.reply_to_id = r.id AND r.chat_jid = m.chat_jid
+		LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
+		LEFT JOIN sender_names sn ON sn.sender = m.sender
+		WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
+		ORDER BY m.timestamp, m.id LIMIT ? OFFSET ?`,
+		chatJID, contextNumMessages, group*contextNumMessages,
+	)
+	if err != nil {
+		return fmt.Errorf("fetch group %d of %s: %w", group, chatJID, err)
+	}
+
+	var groupMsgs []contextMsg
+	for rows.Next() {
+		var m contextMsg
+		if scanErr := rows.Scan(&m.Sender, &m.FullName, &m.Content, &m.Timestamp, &m.ReplyToContent); scanErr == nil {
+			groupMsgs = append(groupMsgs, m)
+		}
+	}
+	rows.Close()
+
+	if len(groupMsgs) == 0 {
+		return nil
+	}
+
+	ctxStr := formatContextWindow(groupMsgs)
+	doc := MessageDocument{
+		ChatJID:        chatJID,
+		Context:        ctxStr,
+		TimestampFirst: groupMsgs[0].Timestamp,
+		TimestampLast:  groupMsgs[len(groupMsgs)-1].Timestamp,
+	}
+
+	if store.embedder != nil {
+		if text := sanitizeForEmbedding(ctxStr); text != "" {
+			vec, err := store.embedder.Embed(text)
+			if err != nil {
+				logger.Warnf("Failed to embed %s group %d: %v", chatJID, group, err)
+			} else {
+				doc.Embedding = vec
+			}
+		}
+	}
+
+	docID := chatJID + ":" + strconv.Itoa(group)
+	if err := store.index.Index(docID, doc); err != nil {
+		return fmt.Errorf("index %s: %w", docID, err)
+	}
+	return nil
 }
 
 // reindexRow holds a group document during batch re-indexing.
@@ -471,11 +572,11 @@ func reIndexAllMessages(store *MessageStore, maxRows int, chatFilter string) err
 				       COALESCE(cn.display_name, sn.display_name, m.full_name),
 				       m.content, m.timestamp, m.is_from_me, m.media_type, m.filename, r.content
 				FROM messages m
-				LEFT JOIN messages r ON m.reply_to_id = r.id
+				LEFT JOIN messages r ON m.reply_to_id = r.id AND r.chat_jid = m.chat_jid
 				LEFT JOIN contact_names cn ON cn.their_jid = CASE WHEN m.sender LIKE '%@%' THEN m.sender ELSE m.sender||'@s.whatsapp.net' END
 				LEFT JOIN sender_names sn ON sn.sender = m.sender
 				WHERE m.chat_jid = ? AND (m.content != '' OR m.media_type != '')
-				ORDER BY m.timestamp
+				ORDER BY m.timestamp, m.id
 			`, jid)
 		if err != nil {
 			logger.Warnf("Failed to query messages for %s: %v", jid, err)

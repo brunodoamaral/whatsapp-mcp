@@ -88,6 +88,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return nil
 	}
 
+	// Voice notes go straight into the download queue: WhatsApp media URLs
+	// expire, so the audio has to reach local disk well before transcription
+	// gets around to it.
+	if mediaType == "audio" && content == "" {
+		audioPipeline.Enqueue(msg.Info.ID, chatJID, msg.Info.Timestamp)
+	}
+
 	// Log message reception
 	timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
 	direction := "←"

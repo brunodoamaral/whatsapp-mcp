@@ -29,6 +29,10 @@ var searchEnabled bool
 var logger waLog.Logger
 var traceEnabled bool
 
+// audioPipeline downloads and transcribes voice notes in the background.
+// nil until Start() runs; its methods tolerate a nil receiver.
+var audioPipeline *AudioPipeline
+
 // tracef logs only when LOG_LEVEL=TRACE
 func tracef(format string, args ...interface{}) {
 	if traceEnabled {
@@ -51,7 +55,29 @@ func main() {
 	reindex := flag.String("reindex", "", `rebuild the search index then exit; use "all" to reindex everything, or a partial JID/phone to reindex only matching chats`)
 	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file (use with --reindex)")
 	maxRows := flag.Int("max-rows", 0, "limit rows processed during --reindex (0 = unlimited, useful with --cpuprofile)")
+	backfill := flag.Bool("transcribe-backfill", false, "transcribe all voice notes whose media is already on disk, then exit")
+	backfillDays := flag.Int("transcribe-since-days", 0, "limit --transcribe-backfill to messages from the last N days (0 = all)")
+	skipIndex := flag.Bool("skip-index", false, "with --transcribe-backfill: write transcripts to SQLite only, leaving the bleve index untouched so the bridge can keep running (requires a later --reindex all)")
 	flag.Parse()
+
+	if *backfill {
+		open := NewMessageStore
+		if *skipIndex {
+			open = NewMessageStoreDBOnly
+		}
+		messageStore, err := open()
+		if err != nil {
+			logger.Errorf("Failed to initialise message store: %v", err)
+			os.Exit(1)
+		}
+		if err := RunTranscribeBackfill(messageStore, *maxRows, *backfillDays); err != nil {
+			logger.Errorf("Backfill failed: %v", err)
+			messageStore.Close()
+			os.Exit(1)
+		}
+		messageStore.Close()
+		os.Exit(0)
+	}
 
 	if *reindex != "" {
 		var profFile *os.File
@@ -309,6 +335,11 @@ func main() {
 	}
 
 	logger.Infof("Connected to WhatsApp!")
+
+	// Start voice-note download/transcription pipeline.
+	audioPipeline = NewAudioPipeline(client, messageStore)
+	audioPipeline.Start()
+	defer audioPipeline.Stop()
 
 	// Start REST API server
 	startRESTServer(client, messageStore, broadcaster, registry, 8080)
