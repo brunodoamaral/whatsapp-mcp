@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -196,9 +197,21 @@ func makeSearchHandler(messageStore *MessageStore) http.HandlerFunc {
 	}
 }
 
+// urlParamJID reads a {jid} path parameter and percent-decodes it. chi returns
+// the raw path segment, so a correctly encoded JID like "5521994260844%40s.whatsapp.net"
+// would otherwise be matched against the database verbatim and find nothing.
+func urlParamJID(r *http.Request) string {
+	raw := chi.URLParam(r, "jid")
+	decoded, err := url.PathUnescape(raw)
+	if err != nil {
+		return raw
+	}
+	return decoded
+}
+
 func makeMuteHandler(messageStore *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		chatJID := chi.URLParam(r, "jid")
+		chatJID := urlParamJID(r)
 		if chatJID == "" {
 			http.Error(w, "Chat JID required", http.StatusBadRequest)
 			return
@@ -228,7 +241,7 @@ func makeMuteHandler(messageStore *MessageStore) http.HandlerFunc {
 
 func makeGetMessagesHandler(messageStore *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		chatJID := chi.URLParam(r, "jid")
+		chatJID := urlParamJID(r)
 		if chatJID == "" {
 			http.Error(w, "Chat JID required", http.StatusBadRequest)
 			return
@@ -300,7 +313,7 @@ func makeGetMessagesHandler(messageStore *MessageStore) http.HandlerFunc {
 
 func makeGetProfilePictureHandler(client *whatsmeow.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		jidStr := chi.URLParam(r, "jid")
+		jidStr := urlParamJID(r)
 		if jidStr == "" {
 			http.Error(w, "JID required", http.StatusBadRequest)
 			return

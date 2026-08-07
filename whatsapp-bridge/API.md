@@ -73,6 +73,8 @@ GET /api/search?q=hello&limit=10&days_since=30&chat_jid=...&semantic_weight=0.5
 
 Results are grouped into context windows of up to 16 consecutive messages.
 
+Note: messages within a search result use Go's default (capitalized, no `omitempty`) field names, unlike every other endpoint below — this differs from the `snake_case` used elsewhere in this API.
+
 Response:
 ```json
 {
@@ -85,13 +87,14 @@ Response:
       "score": 0.95,
       "messages": [
         {
-          "sender": "5511999999999",
-          "full_name": "John",
-          "content": "Hello there!",
-          "time": "2026-01-01T12:00:00Z",
-          "is_from_me": false,
-          "media_type": "",
-          "filename": ""
+          "Time": "2026-01-01T12:00:00Z",
+          "Sender": "5511999999999",
+          "FullName": "John",
+          "Content": "Hello there!",
+          "IsFromMe": false,
+          "MediaType": "",
+          "Filename": "",
+          "ReplyToID": ""
         }
       ]
     }
