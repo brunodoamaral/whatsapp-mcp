@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,6 +21,41 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+// Exit codes distinguish why the process is asking systemd (Restart=always)
+// for a relaunch, visible via `systemctl --user status` / journal.
+const (
+	exitClientOutdated = 2 // events.ClientOutdated: WA rejected our client version outright
+	exitMessageStall   = 3 // watchdog: no message observed for messageWatchdogThreshold
+)
+
+// messageWatchdogThreshold and messageWatchdogCheckInterval are a fallback
+// safety net for the 2026-08-24 incident class: whatsmeow stops
+// auto-reconnecting after some connect failures, and only re-fetches the
+// latest WhatsApp client version at process startup (see main()). The
+// primary response is the *events.ClientOutdated handler below, which exits
+// immediately; this watchdog catches any other silent-stall mode by exiting
+// if no message event has been observed in messageWatchdogThreshold.
+const messageWatchdogThreshold = 3 * time.Hour
+const messageWatchdogCheckInterval = 10 * time.Minute
+
+// lastMessageAt holds the UnixNano time of the last events.Message observed,
+// updated from the whatsmeow event handler and read by runMessageWatchdog.
+var lastMessageAt atomic.Int64
+
+// runMessageWatchdog exits the process if no WhatsApp message has been
+// observed for messageWatchdogThreshold. Intended to run as a goroutine for
+// the lifetime of the process.
+func runMessageWatchdog() {
+	for {
+		time.Sleep(messageWatchdogCheckInterval)
+		last := time.Unix(0, lastMessageAt.Load())
+		if silence := time.Since(last); silence > messageWatchdogThreshold {
+			logger.Errorf("No WhatsApp messages received in %s (last at %s) - exiting so systemd restarts and refreshes the client version", silence.Round(time.Minute), last.Format(time.RFC3339))
+			os.Exit(exitMessageStall)
+		}
+	}
+}
 
 // searchEnabled indicates whether vector/hybrid search is available.
 // Set during NewMessageStore based on whether the embedder initialises successfully.
@@ -220,6 +256,7 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			lastMessageAt.Store(time.Now().UnixNano())
 			// Process regular messages and broadcast to WebSocket subscribers
 			if bm := handleMessage(client, messageStore, v, logger); bm != nil {
 				broadcaster.Broadcast(*bm)
@@ -281,6 +318,15 @@ func main() {
 			// History sync notifications will now be processed
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+
+		case *events.ClientOutdated:
+			// whatsmeow does not auto-reconnect after this failure, and only
+			// re-fetches the latest WhatsApp client version at startup, so
+			// staying up just means silently missing every message until
+			// someone notices and restarts by hand (as happened 2026-08-24).
+			// Exit now and let systemd (Restart=always) relaunch us.
+			logger.Errorf("WhatsApp rejected our client version as outdated - exiting so systemd restarts and refreshes it")
+			os.Exit(exitClientOutdated)
 		}
 	})
 
@@ -335,6 +381,11 @@ func main() {
 	}
 
 	logger.Infof("Connected to WhatsApp!")
+
+	// Start the message watchdog. Baseline it to now so a quiet startup
+	// doesn't immediately look like a stall.
+	lastMessageAt.Store(time.Now().UnixNano())
+	go runMessageWatchdog()
 
 	// Start voice-note download/transcription pipeline.
 	audioPipeline = NewAudioPipeline(client, messageStore)

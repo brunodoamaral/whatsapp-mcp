@@ -106,66 +106,146 @@ func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 }
 
 // ClientRegistry persists the last message timestamp delivered to each named
-// WebSocket client. It survives server restarts via the shared SQLite database.
+// WebSocket client, tracked per chat JID. It survives server restarts via the
+// shared SQLite database.
+//
+// Unfiltered clients (no jids query param) use the empty string "" as their
+// JID bucket: a single global cursor is correct for them because they want
+// every message, not a per-chat replay window. Filtered clients get one
+// cursor per subscribed JID, so that catch-up for one chat is never skipped
+// because a different chat advanced the client's marker first.
 type ClientRegistry struct {
 	db    *sql.DB
 	mu    sync.Mutex
-	cache map[string]time.Time // write-through cache
+	cache map[string]map[string]time.Time // client_name -> chat_jid -> last_seen
 }
 
-// NewClientRegistry creates the client_last_seen table if needed, loads all
-// existing rows into the in-memory cache, and returns a ready registry.
+// NewClientRegistry migrates the client_last_seen table to its per-JID
+// schema if needed, creates it if missing, loads all existing rows into the
+// in-memory cache, and returns a ready registry.
 func NewClientRegistry(db *sql.DB) (*ClientRegistry, error) {
+	if err := migrateClientLastSeenTable(db); err != nil {
+		return nil, err
+	}
+
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS client_last_seen (
-			client_name TEXT PRIMARY KEY,
-			last_seen   TIMESTAMP NOT NULL
+			client_name TEXT NOT NULL,
+			chat_jid    TEXT NOT NULL DEFAULT '',
+			last_seen   TIMESTAMP NOT NULL,
+			PRIMARY KEY (client_name, chat_jid)
 		)`)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := db.Query("SELECT client_name, last_seen FROM client_last_seen")
+	rows, err := db.Query("SELECT client_name, chat_jid, last_seen FROM client_last_seen")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	cache := make(map[string]time.Time)
+	cache := make(map[string]map[string]time.Time)
 	for rows.Next() {
-		var name string
+		var name, jid string
 		var t time.Time
-		if err := rows.Scan(&name, &t); err != nil {
+		if err := rows.Scan(&name, &jid, &t); err != nil {
 			return nil, err
 		}
-		cache[name] = t
+		if cache[name] == nil {
+			cache[name] = make(map[string]time.Time)
+		}
+		cache[name][jid] = t
 	}
 
 	return &ClientRegistry{db: db, cache: cache}, nil
 }
 
-// GetLastSeen returns the last timestamp recorded for the given client name.
-// Returns false if the client has never connected before.
-func (r *ClientRegistry) GetLastSeen(name string) (time.Time, bool) {
+// migrateClientLastSeenTable upgrades a pre-existing client_last_seen table
+// (PRIMARY KEY client_name, one global cursor per client) to the per-JID
+// schema, preserving old rows as each client's "" (unfiltered) cursor.
+// No-op if the table doesn't exist yet or already has the new schema.
+func migrateClientLastSeenTable(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(client_last_seen)`)
+	if err != nil {
+		return err
+	}
+	exists := false
+	hasChatJID := false
+	for rows.Next() {
+		exists = true
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "chat_jid" {
+			hasChatJID = true
+		}
+	}
+	rows.Close()
+	if !exists || hasChatJID {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`ALTER TABLE client_last_seen RENAME TO client_last_seen_old`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE client_last_seen (
+			client_name TEXT NOT NULL,
+			chat_jid    TEXT NOT NULL DEFAULT '',
+			last_seen   TIMESTAMP NOT NULL,
+			PRIMARY KEY (client_name, chat_jid)
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO client_last_seen (client_name, chat_jid, last_seen)
+		SELECT client_name, '', last_seen FROM client_last_seen_old`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE client_last_seen_old`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// GetLastSeen returns the last timestamp recorded for the given client name
+// and JID bucket ("" for an unfiltered client's global cursor). Returns
+// false if that (name, jid) pair has never been recorded.
+func (r *ClientRegistry) GetLastSeen(name, jid string) (time.Time, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	t, ok := r.cache[name]
+	t, ok := r.cache[name][jid]
 	return t, ok
 }
 
-// UpdateLastSeen records t as the new last-seen timestamp for name, but only
-// if t is strictly after the current value. Writes through to SQLite.
-func (r *ClientRegistry) UpdateLastSeen(name string, t time.Time) error {
+// UpdateLastSeen records t as the new last-seen timestamp for (name, jid),
+// but only if t is strictly after the current value. Writes through to SQLite.
+func (r *ClientRegistry) UpdateLastSeen(name, jid string, t time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if existing, ok := r.cache[name]; ok && !t.After(existing) {
+	if existing, ok := r.cache[name][jid]; ok && !t.After(existing) {
 		return nil
 	}
-	r.cache[name] = t
+	if r.cache[name] == nil {
+		r.cache[name] = make(map[string]time.Time)
+	}
+	r.cache[name][jid] = t
 	_, err := r.db.Exec(`
-		INSERT INTO client_last_seen (client_name, last_seen) VALUES (?, ?)
-		ON CONFLICT(client_name) DO UPDATE SET last_seen = excluded.last_seen
+		INSERT INTO client_last_seen (client_name, chat_jid, last_seen) VALUES (?, ?, ?)
+		ON CONFLICT(client_name, chat_jid) DO UPDATE SET last_seen = excluded.last_seen
 		WHERE excluded.last_seen > client_last_seen.last_seen`,
-		name, t)
+		name, jid, t)
 	return err
 }

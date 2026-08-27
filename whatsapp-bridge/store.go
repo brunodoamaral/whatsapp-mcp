@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 	"strings"
 
@@ -487,6 +488,64 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 		bm.Message = msg
 		result = append(result, bm)
 	}
+	return result, nil
+}
+
+// GetMessagesSincePerJID returns missed messages for a filtered WS client
+// that tracks a separate last-seen cursor per subscribed JID. Each JID in
+// since is queried against its own cursor rather than a shared one, so a
+// message on a quiet chat is never skipped just because a different
+// subscribed chat advanced the client's marker first. Results are merged
+// and returned oldest-first.
+func (store *MessageStore) GetMessagesSincePerJID(since map[string]time.Time) ([]BroadcastMessage, error) {
+	var result []BroadcastMessage
+	for jid, t := range since {
+		rows, err := store.db.Query(`
+			SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
+				m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
+				m.is_from_me, m.media_type, m.filename, m.reply_to_id
+			FROM messages m
+			LEFT JOIN chats c ON c.jid = m.chat_jid
+			WHERE m.chat_jid = ? AND m.timestamp > ?
+			ORDER BY m.timestamp ASC`,
+			jid, t)
+		if err != nil {
+			return nil, err
+		}
+
+		for rows.Next() {
+			var bm BroadcastMessage
+			var msg MessageWithID
+			var ts time.Time
+			var mediaType, filename, replyToID sql.NullString
+			err := rows.Scan(
+				&msg.ID, &bm.ChatJID, &bm.ChatName,
+				&msg.Sender, &msg.FullName, &msg.Content, &ts,
+				&msg.IsFromMe, &mediaType, &filename, &replyToID,
+			)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			msg.Time = ts
+			if mediaType.Valid {
+				msg.MediaType = mediaType.String
+			}
+			if filename.Valid {
+				msg.Filename = filename.String
+			}
+			if replyToID.Valid {
+				msg.ReplyToID = replyToID.String
+			}
+			bm.Message = msg
+			result = append(result, bm)
+		}
+		rows.Close()
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Message.Time.Before(result[j].Message.Time)
+	})
 	return result, nil
 }
 

@@ -1,28 +1,29 @@
 module whatsapp-client
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/blevesearch/bleve/v2 v2.5.8-0.20260326152045-6b72a249e566
 	github.com/gomlx/go-huggingface v0.3.4
-	github.com/mattn/go-sqlite3 v1.14.34
+	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/mdp/qrterminal v1.0.1
 	github.com/yalue/onnxruntime_go v1.27.0
-	go.mau.fi/whatsmeow v0.0.0-20260414172242-d4ffc1df2442
-	google.golang.org/protobuf v1.36.11
+	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
+	google.golang.org/protobuf v1.36.12
 )
 
 require (
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/schollz/progressbar/v3 v3.19.0 // indirect
-	golang.org/x/term v0.40.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
 )
 
 replace github.com/gomlx/go-huggingface => github.com/brunodoamaral/go-huggingface v0.0.0-20260326213707-a8e8f038097d
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/RoaringBitmap/roaring/v2 v2.14.5 // indirect
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
@@ -44,7 +45,7 @@ require (
 	github.com/blevesearch/zapx/v15 v15.4.3 // indirect
 	github.com/blevesearch/zapx/v16 v16.3.2 // indirect
 	github.com/blevesearch/zapx/v17 v17.0.5 // indirect
-	github.com/coder/websocket v1.8.14 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eliben/go-sentencepiece v0.7.0 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
@@ -56,17 +57,17 @@ require (
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
-	github.com/petermattis/goid v0.0.0-20260113132338-7c7de50cc741 // indirect
+	github.com/petermattis/goid v0.0.0-20260816044145-ed329add6b1b // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/rs/zerolog v1.34.0 // indirect
+	github.com/rs/zerolog v1.35.1 // indirect
 	github.com/vektah/gqlparser/v2 v2.5.31 // indirect
 	go.etcd.io/bbolt v1.4.0 // indirect
-	go.mau.fi/libsignal v0.2.1 // indirect
-	go.mau.fi/util v0.9.6 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
-	golang.org/x/net v0.50.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
+	go.mau.fi/libsignal v0.2.2 // indirect
+	go.mau.fi/util v0.10.1-0.20260820140024-eb612d936fde // indirect
+	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )

@@ -356,10 +356,23 @@ func makeGetProfilePictureHandler(client *whatsmeow.Client) http.HandlerFunc {
 	}
 }
 
-// sendAndTrack sends a message and updates the client's last-seen timestamp.
-func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientRegistry, clientName string, msg BroadcastMessage) error {
-	_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
+// sendAndTrack sends a message and updates the client's last-seen timestamp
+// for the given JID bucket (see ClientRegistry for what the bucket means).
+func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientRegistry, clientName, jidKey string, msg BroadcastMessage) error {
+	_ = registry.UpdateLastSeen(clientName, jidKey, msg.Message.Time)
 	return sendToClient(ctx, conn, msg)
+}
+
+// lastSeenKey returns the JID bucket a client's last-seen cursor should use
+// for a message on chatJID: unfiltered clients (no jids param) share one
+// global "" cursor, while filtered clients get one cursor per JID so that
+// catch-up on one subscribed chat is never skipped just because another
+// subscribed chat advanced the marker first.
+func lastSeenKey(channels []string, chatJID string) string {
+	if len(channels) == 0 {
+		return ""
+	}
+	return chatJID
 }
 
 // sendToClient marshals msg and writes it to conn.
@@ -410,24 +423,44 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 
 		ctx := r.Context()
 
-		// Catch-up: replay messages missed since last disconnect.
-		if lastSeen, ok := registry.GetLastSeen(clientName); ok {
-			logger.Infof("WS catch-up start: client=%q lastSeen=%s jids=%v", clientName, lastSeen, channels)
-			missed, err := store.GetAllMessagesSince(lastSeen, channels)
-			if err != nil {
-				logger.Warnf("WS catch-up query failed for client %q: %v", clientName, err)
+		// Catch-up: replay messages missed since last disconnect. Unfiltered
+		// clients use one global "" cursor; filtered clients use one cursor
+		// per subscribed JID so a quiet chat's backlog is never skipped just
+		// because a different chat advanced a shared marker first.
+		var missed []BroadcastMessage
+		var catchUpErr error
+		if len(channels) == 0 {
+			if lastSeen, ok := registry.GetLastSeen(clientName, ""); ok {
+				logger.Infof("WS catch-up start: client=%q lastSeen=%s (unfiltered)", clientName, lastSeen)
+				missed, catchUpErr = store.GetAllMessagesSince(lastSeen, nil)
 			} else {
-				logger.Infof("WS catch-up: client=%q replaying %d messages", clientName, len(missed))
-				for _, msg := range missed {
-					if err := sendAndTrack(ctx, conn, registry, clientName, msg); err != nil {
-						logger.Warnf("WS catch-up aborted: client=%q sendAndTrack error", clientName)
-						return
-					}
-				}
-				logger.Infof("WS catch-up complete: client=%q", clientName)
+				logger.Infof("WS catch-up skipped: client=%q (no lastSeen in registry)", clientName)
 			}
 		} else {
-			logger.Infof("WS catch-up skipped: client=%q (no lastSeen in registry)", clientName)
+			since := make(map[string]time.Time)
+			for _, jid := range channels {
+				if lastSeen, ok := registry.GetLastSeen(clientName, jid); ok {
+					since[jid] = lastSeen
+				}
+			}
+			if len(since) > 0 {
+				logger.Infof("WS catch-up start: client=%q cursors=%v", clientName, since)
+				missed, catchUpErr = store.GetMessagesSincePerJID(since)
+			} else {
+				logger.Infof("WS catch-up skipped: client=%q (no lastSeen for any subscribed jid)", clientName)
+			}
+		}
+		if catchUpErr != nil {
+			logger.Warnf("WS catch-up query failed for client %q: %v", clientName, catchUpErr)
+		} else if missed != nil {
+			logger.Infof("WS catch-up: client=%q replaying %d messages", clientName, len(missed))
+			for _, msg := range missed {
+				if err := sendAndTrack(ctx, conn, registry, clientName, lastSeenKey(channels, msg.ChatJID), msg); err != nil {
+					logger.Warnf("WS catch-up aborted: client=%q sendAndTrack error", clientName)
+					return
+				}
+			}
+			logger.Infof("WS catch-up complete: client=%q", clientName)
 		}
 
 		ch := broadcaster.Subscribe(channels)
@@ -448,7 +481,7 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				}
 				// Always advance last-seen timestamp to avoid replaying
 				// already-seen but filtered messages on reconnect.
-				_ = registry.UpdateLastSeen(clientName, msg.Message.Time)
+				_ = registry.UpdateLastSeen(clientName, lastSeenKey(channels, msg.ChatJID), msg.Message.Time)
 				logger.Debugf("WS received broadcast: client=%q chat=%q jid=%s id=%d", clientName, msg.ChatName, msg.ChatJID, msg.Message.ID)
 				if err := sendToClient(ctx, conn, msg); err != nil {
 					logger.Warnf("WS sendToClient error: client=%q chat=%q err=%v", clientName, msg.ChatName, err)
