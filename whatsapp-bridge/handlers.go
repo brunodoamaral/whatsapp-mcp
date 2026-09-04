@@ -48,6 +48,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broad
 	r.Get("/api/search", makeSearchHandler(messageStore))
 	r.Post("/api/chats/{jid}/mute", makeMuteHandler(messageStore))
 	r.Get("/api/chats/{jid}/messages", makeGetMessagesHandler(messageStore))
+	r.Post("/api/query", makeQueryHandler())
 	r.Get("/api/contacts/{jid}/profile-picture", makeGetProfilePictureHandler(client))
 	r.Get("/ws/messages", makeWSHandler(broadcaster, registry, messageStore))
 

@@ -392,6 +392,11 @@ func main() {
 	audioPipeline.Start()
 	defer audioPipeline.Stop()
 
+	// Read-only SQL query endpoint for trusted local tooling.
+	if err := initQueryDB(); err != nil {
+		logger.Errorf("Failed to init read-only query database: %v", err)
+	}
+
 	// Start REST API server
 	startRESTServer(client, messageStore, broadcaster, registry, 8080)
 

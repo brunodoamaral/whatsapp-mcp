@@ -184,6 +184,52 @@ Response (unchanged, `known_id` matched the current picture):
 
 ---
 
+## Read-only SQL query
+
+```
+POST /api/query
+```
+
+```json
+{
+  "sql": "SELECT jid, name FROM chats WHERE jid = ?",
+  "args": ["5511999999999@s.whatsapp.net"],
+  "limit": 500
+}
+```
+
+For trusted local tooling that needs ad-hoc access to `chats`/`messages` beyond
+what the fixed endpoints above expose (e.g. cross-chat aggregate prefiltering).
+Not intended to be reachable beyond localhost.
+
+`whatsapp.db` is attached read-only as `wdb`, so queries can also join against
+`wdb.whatsmeow_contacts` and `wdb.whatsmeow_lid_map` (e.g. to resolve an `@lid`
+chat JID to the underlying phone-number JID).
+
+| Field | Default | Description |
+|---|---|---|
+| `sql` | required | Must start with `SELECT` or `WITH`. Single statement only |
+| `args` | `[]` | Positional `?` parameters, bound (not interpolated) |
+| `limit` | 500 | Max rows returned (max 5000) |
+
+Enforcement is layered: the connection itself is opened `mode=ro&_query_only=1`
+(SQLite refuses writes at the driver level regardless of the SQL text), and the
+handler additionally rejects anything not starting with `SELECT`/`WITH` and any
+multi-statement input. Queries time out after 5s.
+
+Response:
+```json
+{
+  "columns": ["jid", "name"],
+  "rows": [["5511999999999@s.whatsapp.net", "John"]],
+  "truncated": false
+}
+```
+
+`truncated: true` means more rows matched than `limit` allowed.
+
+---
+
 ## Mute chat
 
 ```
