@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,9 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // Voice-note transcription pipeline.
@@ -36,7 +40,12 @@ const (
 	tsEmpty      = "empty"      // ran, produced nothing usable (silence/noise/hallucination)
 	tsNoMedia    = "no_media"   // media gone from WhatsApp servers, unrecoverable
 	tsFailed     = "failed"     // ffmpeg/whisper error, retried on next sweep
+	tsRetrying   = "retrying"   // asked the sender's phone to re-upload, awaiting response
 )
+
+// mediaRetryTimeout bounds how long we wait for the sender's phone to answer
+// a SendMediaRetryReceipt before giving up and marking the row terminal.
+const mediaRetryTimeout = 30 * time.Second
 
 const (
 	// repeatRunLimit truncates a transcript at the point where whisper falls
@@ -112,16 +121,32 @@ type AudioPipeline struct {
 	wg          sync.WaitGroup
 	stop        chan struct{}
 	stopOnce    sync.Once
+
+	retryMu      sync.Mutex
+	pendingRetry map[string]*mediaRetryState // messageID -> state, awaiting a MediaRetry event
+}
+
+// mediaRetryState carries what's needed to finish a download once the
+// sender's phone answers a SendMediaRetryReceipt with a fresh DirectPath.
+type mediaRetryState struct {
+	chatJID       string
+	mediaType     string
+	filename      string
+	mediaKey      []byte
+	fileSHA256    []byte
+	fileEncSHA256 []byte
+	timer         *time.Timer
 }
 
 func NewAudioPipeline(client *whatsmeow.Client, store *MessageStore) *AudioPipeline {
 	return &AudioPipeline{
-		client:      client,
-		store:       store,
-		cfg:         loadTranscribeConfig(),
-		downloads:   make(chan audioJob, 256),
-		transcripts: make(chan audioJob, 256),
-		stop:        make(chan struct{}),
+		client:       client,
+		store:        store,
+		cfg:          loadTranscribeConfig(),
+		downloads:    make(chan audioJob, 256),
+		transcripts:  make(chan audioJob, 256),
+		stop:         make(chan struct{}),
+		pendingRetry: make(map[string]*mediaRetryState),
 	}
 }
 
@@ -202,23 +227,224 @@ func (p *AudioPipeline) downloadWorker() {
 	}
 }
 
+// downloadRetryDelays are the backoffs between in-process download attempts.
+// A 403 moments after a message arrives is often the media server not yet
+// having propagated the blob, not the "expired after weeks" case the status
+// name documents — so it's worth a few retries before giving up. Once these
+// are exhausted the failure is treated as permanent, same as before.
+var downloadRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
+
 func (p *AudioPipeline) download(job audioJob) {
-	ok, _, _, path, err := downloadMedia(p.client, p.store, job.id, job.chatJID)
-	if !ok || err != nil {
-		// Expired URL or missing media keys. Not retried aggressively: once
-		// WhatsApp drops the blob it is gone for good.
-		logger.Warnf("Audio download failed for %s: %v", job.id, err)
-		p.setStatus(job.id, job.chatJID, tsNoMedia)
+	var err error
+	for attempt := 0; ; attempt++ {
+		var ok bool
+		var path string
+		ok, _, _, path, err = downloadMedia(p.client, p.store, job.id, job.chatJID)
+		if ok && err == nil {
+			tracef("Audio downloaded: %s -> %s", job.id, path)
+			p.setStatus(job.id, job.chatJID, tsDownloaded)
+			select {
+			case p.transcripts <- job:
+			default:
+				logger.Warnf("Transcription queue full, deferring %s to next sweep", job.id)
+			}
+			return
+		}
+		if attempt >= len(downloadRetryDelays) {
+			break
+		}
+		logger.Warnf("Audio download failed for %s (attempt %d/%d), retrying in %s: %v",
+			job.id, attempt+1, len(downloadRetryDelays)+1, downloadRetryDelays[attempt], err)
+		select {
+		case <-p.stop:
+			return
+		case <-time.After(downloadRetryDelays[attempt]):
+		}
+	}
+	logger.Warnf("Audio download failed for %s after %d attempts: %v", job.id, len(downloadRetryDelays)+1, err)
+
+	// 403/404/410 mean the CDN blob itself is gone; whatsmeow deliberately
+	// doesn't retry those over HTTP (it already tried every host). The one
+	// real recovery path left is asking the sender's phone to re-upload via
+	// the media-retry receipt protocol.
+	if isPermanentMediaDownloadError(err) && p.client != nil {
+		if p.requestMediaRetry(job) {
+			return
+		}
+	}
+	p.setStatus(job.id, job.chatJID, tsNoMedia)
+}
+
+func isPermanentMediaDownloadError(err error) bool {
+	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
+}
+
+// requestMediaRetry asks the sender's phone to re-upload a message's media.
+// Returns true if the request was sent and the row is now parked in
+// tsRetrying awaiting the async *events.MediaRetry response (handled by
+// HandleMediaRetryEvent), false if it couldn't even be sent.
+func (p *AudioPipeline) requestMediaRetry(job audioJob) bool {
+	mediaType, filename, _, mediaKey, fileSHA256, fileEncSHA256, _, err := p.store.GetMediaInfo(job.id, job.chatJID)
+	if err != nil || len(mediaKey) == 0 {
+		logger.Warnf("Media retry skipped for %s: no media key on file: %v", job.id, err)
+		return false
+	}
+
+	var sender, chatJIDStr string
+	var isFromMe bool
+	if err := p.store.db.QueryRow(
+		`SELECT sender, is_from_me, chat_jid FROM messages WHERE id = ? AND chat_jid = ?`,
+		job.id, job.chatJID,
+	).Scan(&sender, &isFromMe, &chatJIDStr); err != nil {
+		logger.Warnf("Media retry skipped for %s: %v", job.id, err)
+		return false
+	}
+
+	chatJID, err := types.ParseJID(chatJIDStr)
+	if err != nil {
+		logger.Warnf("Media retry skipped for %s: bad chat JID %s: %v", job.id, chatJIDStr, err)
+		return false
+	}
+	isGroup := strings.HasSuffix(chatJIDStr, "@g.us")
+	var senderJID types.JID
+	if isGroup {
+		// Senders are stored bare (see events.go); this account's contacts are
+		// all @lid-addressed, so that's the server to reconstruct here too.
+		senderJID, err = types.ParseJID(sender + "@lid")
+		if err != nil {
+			logger.Warnf("Media retry skipped for %s: bad sender %s: %v", job.id, sender, err)
+			return false
+		}
+	}
+
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chatJID,
+			Sender:   senderJID,
+			IsFromMe: isFromMe,
+			IsGroup:  isGroup,
+		},
+		ID: types.MessageID(job.id),
+	}
+
+	if err := p.client.SendMediaRetryReceipt(context.Background(), info, mediaKey); err != nil {
+		logger.Warnf("Failed to send media retry receipt for %s: %v", job.id, err)
+		return false
+	}
+
+	state := &mediaRetryState{
+		chatJID:       job.chatJID,
+		mediaType:     mediaType,
+		filename:      filename,
+		mediaKey:      mediaKey,
+		fileSHA256:    fileSHA256,
+		fileEncSHA256: fileEncSHA256,
+	}
+	p.retryMu.Lock()
+	p.pendingRetry[job.id] = state
+	state.timer = time.AfterFunc(mediaRetryTimeout, func() { p.expireMediaRetry(job) })
+	p.retryMu.Unlock()
+
+	logger.Infof("Requested media re-upload from sender's phone for %s, awaiting response", job.id)
+	p.setStatus(job.id, job.chatJID, tsRetrying)
+	return true
+}
+
+// expireMediaRetry fires when the sender's phone never answers a media-retry
+// request in time (offline, uninstalled, etc.) — the row is terminal either way.
+func (p *AudioPipeline) expireMediaRetry(job audioJob) {
+	p.retryMu.Lock()
+	_, ok := p.pendingRetry[job.id]
+	delete(p.pendingRetry, job.id)
+	p.retryMu.Unlock()
+	if !ok {
 		return
 	}
-	tracef("Audio downloaded: %s -> %s", job.id, path)
-	p.setStatus(job.id, job.chatJID, tsDownloaded)
+	logger.Warnf("Media retry timed out for %s, giving up", job.id)
+	p.setStatus(job.id, job.chatJID, tsNoMedia)
+}
 
-	select {
-	case p.transcripts <- job:
-	default:
-		logger.Warnf("Transcription queue full, deferring %s to next sweep", job.id)
+// HandleMediaRetryEvent completes a download once the sender's phone answers
+// a SendMediaRetryReceipt (see requestMediaRetry). Unsolicited or
+// already-resolved events are ignored.
+func (p *AudioPipeline) HandleMediaRetryEvent(evt *events.MediaRetry) {
+	id := string(evt.MessageID)
+	p.retryMu.Lock()
+	state, ok := p.pendingRetry[id]
+	if ok {
+		state.timer.Stop()
+		delete(p.pendingRetry, id)
 	}
+	p.retryMu.Unlock()
+	if !ok {
+		return
+	}
+
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, state.mediaKey)
+	if err != nil {
+		logger.Warnf("Media retry for %s came back unusable: %v", id, err)
+		p.setStatus(id, state.chatJID, tsNoMedia)
+		return
+	}
+	if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+		logger.Warnf("Media retry for %s came back as %s", id, notif.GetResult())
+		p.setStatus(id, state.chatJID, tsNoMedia)
+		return
+	}
+
+	path, err := p.downloadWithDirectPath(id, state, notif.GetDirectPath())
+	if err != nil {
+		logger.Warnf("Re-upload succeeded but download still failed for %s: %v", id, err)
+		p.setStatus(id, state.chatJID, tsNoMedia)
+		return
+	}
+
+	logger.Infof("Recovered media via retry receipt: %s -> %s", id, path)
+	p.setStatus(id, state.chatJID, tsDownloaded)
+	select {
+	case p.transcripts <- audioJob{id: id, chatJID: state.chatJID}:
+	default:
+		logger.Warnf("Transcription queue full, deferring %s to next sweep", id)
+	}
+}
+
+// downloadWithDirectPath downloads and decrypts media from a freshly issued
+// DirectPath (from a media-retry response), mirroring downloadMedia's
+// local-file layout so the rest of the pipeline can't tell the difference.
+func (p *AudioPipeline) downloadWithDirectPath(id string, state *mediaRetryState, directPath string) (string, error) {
+	var waMediaType whatsmeow.MediaType
+	switch state.mediaType {
+	case "image":
+		waMediaType = whatsmeow.MediaImage
+	case "video":
+		waMediaType = whatsmeow.MediaVideo
+	case "audio":
+		waMediaType = whatsmeow.MediaAudio
+	case "document":
+		waMediaType = whatsmeow.MediaDocument
+	default:
+		return "", fmt.Errorf("unsupported media type: %s", state.mediaType)
+	}
+
+	data, err := p.client.DownloadMediaWithPath(
+		context.Background(), directPath, state.fileEncSHA256, state.fileSHA256, state.mediaKey, waMediaType, "", false,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to download media: %w", err)
+	}
+
+	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(state.chatJID, ":", "_"))
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create chat directory: %w", err)
+	}
+	localPath := fmt.Sprintf("%s/%s", chatDir, state.filename)
+	if err := os.WriteFile(localPath, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to save media file: %w", err)
+	}
+	absPath, _ := filepath.Abs(localPath)
+	return absPath, nil
 }
 
 func (p *AudioPipeline) transcribeWorker() {
@@ -468,6 +694,16 @@ func (p *AudioPipeline) sweeper() {
 }
 
 func (p *AudioPipeline) sweep() {
+	// A restart loses the in-memory pendingRetry map and its timers, so any
+	// row still marked tsRetrying at this point is orphaned — fall it back to
+	// tsPending so the normal download path (and possibly another media-retry
+	// request) picks it up again.
+	if _, err := p.store.db.Exec(
+		`UPDATE messages SET transcript_status = ? WHERE transcript_status = ?`, tsPending, tsRetrying,
+	); err != nil {
+		logger.Warnf("Failed to reclaim orphaned media-retry rows: %v", err)
+	}
+
 	// tsFailed is retried; tsNoMedia, tsDone and tsEmpty are terminal.
 	queued := p.enqueueByStatus([]string{tsPending, tsFailed}, p.downloads)
 	ready := p.enqueueByStatus([]string{tsDownloaded}, p.transcripts)

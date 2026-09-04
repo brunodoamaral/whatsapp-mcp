@@ -265,6 +265,11 @@ func main() {
 		case *events.Contact:
 			tracef("Syncing Contacts!")
 
+		case *events.MediaRetry:
+			if audioPipeline != nil {
+				audioPipeline.HandleMediaRetryEvent(v)
+			}
+
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
