@@ -8,7 +8,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/mdp/qrterminal v1.0.1
 	github.com/yalue/onnxruntime_go v1.27.0
-	go.mau.fi/whatsmeow v0.0.0-20260821141805-33cfac511629
+	go.mau.fi/whatsmeow v0.0.0-20260904121843-28bfe537ea6a
 	google.golang.org/protobuf v1.36.12
 )
 
