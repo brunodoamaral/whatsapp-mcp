@@ -14,11 +14,26 @@ type BroadcastMessage struct {
 	Message  MessageWithID `json:"message"`
 }
 
-// subscriber holds a WebSocket client's channel and its JID filter.
+// TypingMessage is the payload sent to WebSocket subscribers who opted in
+// (typing=true) for a chat-presence (typing/paused) update. JID identifies
+// whoever's presence changed: the other party in the chat, or — when
+// IsFromMe is true — one of the account's own other linked devices
+// composing/pausing in that chat.
+type TypingMessage struct {
+	ChatJID  string `json:"chat_jid"`
+	JID      string `json:"jid"`
+	IsFromMe bool   `json:"is_from_me"`
+	State    string `json:"state"` // "composing" or "paused"
+}
+
+// subscriber holds a WebSocket client's channels and its JID filter.
 // An empty jids slice means no filtering — all messages are delivered.
+// typingCh is nil unless the client opted into typing events, and a nil
+// channel is never selected on, so no extra guarding is needed elsewhere.
 type subscriber struct {
-	ch   chan BroadcastMessage
-	jids []string
+	ch       chan BroadcastMessage
+	typingCh chan TypingMessage
+	jids     []string
 }
 
 // MessageBroadcaster fan-outs incoming messages to all connected WebSocket
@@ -35,41 +50,51 @@ func NewMessageBroadcaster() *MessageBroadcaster {
 	}
 }
 
-// Subscribe registers a new subscriber and returns its receive channel.
+// Subscribe registers a new subscriber and returns its receive channels.
 // If jids is non-empty, only messages matching those JIDs are delivered.
-// The caller must call Unsubscribe when done to avoid a goroutine/channel leak.
-func (b *MessageBroadcaster) Subscribe(jids []string) chan BroadcastMessage {
+// The typing channel is nil unless wantTyping is true. The caller must call
+// Unsubscribe when done to avoid a goroutine/channel leak.
+func (b *MessageBroadcaster) Subscribe(jids []string, wantTyping bool) (chan BroadcastMessage, chan TypingMessage) {
 	ch := make(chan BroadcastMessage, 64)
+	var typingCh chan TypingMessage
+	if wantTyping {
+		typingCh = make(chan TypingMessage, 64)
+	}
 	b.mu.Lock()
-	b.clients[&subscriber{ch: ch, jids: jids}] = struct{}{}
+	b.clients[&subscriber{ch: ch, typingCh: typingCh, jids: jids}] = struct{}{}
 	b.mu.Unlock()
-	return ch
+	return ch, typingCh
 }
 
-// Unsubscribe removes the channel from the subscriber map and closes it.
-// The delete happens before the close so that a concurrent Broadcast call
-// (holding only a read-lock over the same map snapshot) will never see the
-// already-closed channel.
+// Unsubscribe removes the channel from the subscriber map and closes it
+// (and its typing channel, if any). The delete happens before the close so
+// that a concurrent Broadcast call (holding only a read-lock over the same
+// map snapshot) will never see the already-closed channel.
 func (b *MessageBroadcaster) Unsubscribe(ch chan BroadcastMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	var typingCh chan TypingMessage
 	for sub := range b.clients {
 		if sub.ch == ch {
+			typingCh = sub.typingCh
 			delete(b.clients, sub)
 			break
 		}
 	}
 	close(ch)
+	if typingCh != nil {
+		close(typingCh)
+	}
 }
 
-// jidMatches checks if msg.ChatJID matches any of the subscriber's JID filters.
+// jidMatches checks if chatJID matches any of the subscriber's JID filters.
 // If the subscriber has no filters (empty slice), all messages match.
-func (b *MessageBroadcaster) jidMatches(sub *subscriber, msg BroadcastMessage) bool {
+func (b *MessageBroadcaster) jidMatches(sub *subscriber, chatJID string) bool {
 	if len(sub.jids) == 0 {
 		return true
 	}
 	for _, jid := range sub.jids {
-		if jid == msg.ChatJID {
+		if jid == chatJID {
 			return true
 		}
 	}
@@ -90,7 +115,7 @@ func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 	dropped := 0
 	filtered := 0
 	for sub := range b.clients {
-		if !b.jidMatches(sub, msg) {
+		if !b.jidMatches(sub, msg.ChatJID) {
 			filtered++
 			continue
 		}
@@ -103,6 +128,26 @@ func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 		}
 	}
 	logger.Infof("Broadcast done: chat=%q delivered=%d dropped=%d filtered=%d", msg.ChatName, delivered, dropped, filtered)
+}
+
+// BroadcastTyping delivers a typing/paused chat-presence update to
+// subscribers who opted into typing events and whose JID filter (if any)
+// matches the chat. Sends are non-blocking, same as Broadcast: a slow
+// consumer never stalls the WhatsApp event handler goroutine.
+func (b *MessageBroadcaster) BroadcastTyping(msg TypingMessage) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	for sub := range b.clients {
+		if sub.typingCh == nil || !b.jidMatches(sub, msg.ChatJID) {
+			continue
+		}
+		select {
+		case sub.typingCh <- msg:
+		default:
+			logger.Warnf("BroadcastTyping dropped: chat=%q subscriber buffer full", msg.ChatJID)
+		}
+	}
 }
 
 // ClientRegistry persists the last message timestamp delivered to each named

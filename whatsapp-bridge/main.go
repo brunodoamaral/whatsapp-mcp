@@ -18,6 +18,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
@@ -270,11 +271,31 @@ func main() {
 				audioPipeline.HandleMediaRetryEvent(v)
 			}
 
+		case *events.ChatPresence:
+			// v.IsFromMe means the update is about our own account: another
+			// of our linked devices composing/pausing in that chat, not a
+			// separate WhatsApp user. See CLAUDE.md / API.md for details.
+			broadcaster.BroadcastTyping(TypingMessage{
+				ChatJID:  v.Chat.String(),
+				JID:      v.Sender.String(),
+				IsFromMe: v.IsFromMe,
+				State:    string(v.State),
+			})
+
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
 		case *events.Connected:
+			// Mark ourselves online. Required for WhatsApp to send us any
+			// chat-presence (typing/paused) updates at all — see
+			// events.ChatPresence below — and as a side effect enables
+			// active read receipts. This does make the account show as
+			// "online" to contacts.
+			if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+				logger.Warnf("Failed to send available presence: %v", err)
+			}
+
 			// STEP 1: Fetch contacts from critical_unblock_low app state
 			logger.Infof("Step 1: Syncing contacts...")
 			err := client.FetchAppState(context.Background(), appstate.WAPatchCriticalUnblockLow, true, false)

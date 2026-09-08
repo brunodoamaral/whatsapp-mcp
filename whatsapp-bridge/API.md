@@ -260,6 +260,7 @@ GET /ws/messages?client_name=my-app&jids=5511999999999@s.whatsapp.net,123456789@
 |---|---|---|
 | `client_name` | required | Unique name for this client (used for catch-up tracking) |
 | `jids` | — | Comma-separated JIDs to filter (omit to receive all messages) |
+| `typing` | `false` | Set to `true` to also receive typing/paused chat-presence events |
 
 Connect with any WebSocket client. Each incoming WhatsApp message is pushed immediately as JSON:
 
@@ -284,6 +285,23 @@ Connect with any WebSocket client. Each incoming WhatsApp message is pushed imme
 `media_type`, `filename`, and `reply_to_id` are omitted when empty.
 
 **Catch-up:** On connect, the server replays all messages missed since this client's last disconnect (tracked by `client_name`). If `jids` is set, only messages matching those JIDs are replayed. This ensures clients never miss messages across restarts.
+
+**Typing events (`typing=true`):** When enabled, a `typing` payload is pushed whenever someone starts or stops typing in a chat the connection is subscribed to (or any chat, if `jids` is omitted):
+
+```json
+{
+  "typing": {
+    "chat_jid": "5511999999999@s.whatsapp.net",
+    "jid": "5511999999999@s.whatsapp.net",
+    "is_from_me": false,
+    "state": "composing"
+  }
+}
+```
+
+`state` is `composing` (started typing) or `paused` (stopped typing) — WhatsApp doesn't guarantee a `paused` for every `composing` (e.g. the message may just be sent instead), so don't assume the two always pair up. `is_from_me: true` means `jid` is one of your *own* other linked devices composing/pausing in that chat (WhatsApp's multi-device sync), not another person — the account's own typing indicator isn't shown to itself in the app UI, but the bridge, as a companion device, does receive the underlying protocol event. Typing events are not persisted and are not replayed by catch-up.
+
+For typing events to arrive at all, the bridge sends an "available" presence to WhatsApp on every connect (unconditionally, regardless of whether any client has `typing=true`) — this also makes the account show as online to contacts and enables active read receipts.
 
 ---
 

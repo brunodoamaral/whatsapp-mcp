@@ -389,6 +389,20 @@ func sendToClient(ctx context.Context, conn *websocket.Conn, msg BroadcastMessag
 	return err
 }
 
+// sendTypingToClient marshals a typing update, wrapped under a "typing" key
+// so it's distinguishable from a regular message payload, and writes it to
+// conn. Returns an error if writing fails.
+func sendTypingToClient(ctx context.Context, conn *websocket.Conn, msg TypingMessage) error {
+	data, err := json.Marshal(map[string]TypingMessage{"typing": msg})
+	if err != nil {
+		return nil // skip un-marshallable messages
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err = conn.Write(writeCtx, websocket.MessageText, data)
+	cancel()
+	return err
+}
+
 func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, store *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		clientName := r.URL.Query().Get("client_name")
@@ -410,7 +424,8 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				}
 			}
 		}
-		logger.Infof("WS parameters: client=%q jids=%v (%d channels)", clientName, channelsStr, len(channels))
+		wantTyping := r.URL.Query().Get("typing") == "true"
+		logger.Infof("WS parameters: client=%q jids=%v (%d channels) typing=%v", clientName, channelsStr, len(channels), wantTyping)
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
@@ -464,9 +479,9 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 			logger.Infof("WS catch-up complete: client=%q", clientName)
 		}
 
-		ch := broadcaster.Subscribe(channels)
+		ch, typingCh := broadcaster.Subscribe(channels, wantTyping)
 		defer broadcaster.Unsubscribe(ch)
-		logger.Infof("WS subscribed to broadcaster: client=%q channels=%v", clientName, channels)
+		logger.Infof("WS subscribed to broadcaster: client=%q channels=%v typing=%v", clientName, channels, wantTyping)
 
 		for {
 			select {
@@ -489,6 +504,19 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 					return
 				}
 				logger.Debugf("WS sent message: client=%q chat=%q", clientName, msg.ChatName)
+			// A nil typingCh (wantTyping == false) is never ready, so this
+			// case simply never fires for clients that didn't opt in.
+			case tmsg, ok := <-typingCh:
+				if !ok {
+					logger.Warnf("WS typing broadcaster channel closed: client=%q", clientName)
+					conn.Close(websocket.StatusNormalClosure, "broadcaster closed")
+					return
+				}
+				logger.Debugf("WS received typing: client=%q chat=%q jid=%s state=%s fromMe=%v", clientName, tmsg.ChatJID, tmsg.JID, tmsg.State, tmsg.IsFromMe)
+				if err := sendTypingToClient(ctx, conn, tmsg); err != nil {
+					logger.Warnf("WS sendTypingToClient error: client=%q chat=%q err=%v", clientName, tmsg.ChatJID, err)
+					return
+				}
 			}
 		}
 	}
