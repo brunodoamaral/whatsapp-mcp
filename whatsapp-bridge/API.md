@@ -184,6 +184,55 @@ Response (unchanged, `known_id` matched the current picture):
 
 ---
 
+## Profile picture (cacheable image)
+
+```
+GET /api/contacts/{jid}/avatar
+```
+
+Serves the actual image bytes (not JSON) from a small server-side cache, so
+it can be used directly as an `<img src>` and rely on standard HTTP caching
+instead of re-fetching WhatsApp's short-lived signed CDN URL on every view.
+Unlike `/profile-picture`, this URL is stable per `jid` and supports
+conditional requests.
+
+Example:
+```
+GET /api/contacts/5511999999999@s.whatsapp.net/avatar
+```
+
+Response headers (picture available):
+```
+200 OK
+ETag: "abc123"
+Cache-Control: private, max-age=3600
+Content-Type: image/jpeg
+
+<binary image data>
+```
+
+Send the `ETag` value back as `If-None-Match` to revalidate without
+re-downloading:
+```
+GET /api/contacts/5511999999999@s.whatsapp.net/avatar
+If-None-Match: "abc123"
+```
+```
+304 Not Modified
+```
+
+If the contact has no profile picture (or has hidden it), responds `404`
+with a `Cache-Control` header too, so repeat requests don't need to ask
+WhatsApp again within the cache window.
+
+The server refreshes its cache in the background on access: a cached picture
+younger than a few hours is served with no call to WhatsApp at all; older
+entries are revalidated cheaply (no image re-download unless the picture
+actually changed) rather than re-fetched in full. See this repo's `CLAUDE.md`
+for the exact freshness windows and why.
+
+---
+
 ## Read-only SQL query
 
 ```
@@ -261,6 +310,8 @@ GET /ws/messages?client_name=my-app&jids=5511999999999@s.whatsapp.net,123456789@
 | `client_name` | required | Unique name for this client (used for catch-up tracking) |
 | `jids` | — | Comma-separated JIDs to filter (omit to receive all messages) |
 | `typing` | `false` | Set to `true` to also receive typing/paused chat-presence events |
+| `groupinfo` | `false` | Set to `true` to also receive group metadata change events (rename, topic, membership, settings) |
+| `pushname` | `false` | Set to `true` to also receive contact display-name change events |
 
 Connect with any WebSocket client. Each incoming WhatsApp message is pushed immediately as JSON:
 
@@ -302,6 +353,53 @@ Connect with any WebSocket client. Each incoming WhatsApp message is pushed imme
 `state` is `composing` (started typing) or `paused` (stopped typing) — WhatsApp doesn't guarantee a `paused` for every `composing` (e.g. the message may just be sent instead), so don't assume the two always pair up. `is_from_me: true` means `jid` is one of your *own* other linked devices composing/pausing in that chat (WhatsApp's multi-device sync), not another person — the account's own typing indicator isn't shown to itself in the app UI, but the bridge, as a companion device, does receive the underlying protocol event. Typing events are not persisted and are not replayed by catch-up.
 
 For typing events to arrive at all, the bridge sends an "available" presence to WhatsApp on every connect (unconditionally, regardless of whether any client has `typing=true`) — this also makes the account show as online to contacts and enables active read receipts.
+
+**Group info events (`groupinfo=true`):** When enabled, a `groupinfo` payload is pushed whenever a group's metadata changes — rename, topic/description, membership (join/leave/promote/demote), or settings (locked/announce/disappearing-messages/membership-approval/invite-link/deletion) — for a group the connection is subscribed to (or any group, if `jids` is omitted):
+
+```json
+{
+  "groupinfo": {
+    "chat_jid": "123456789@g.us",
+    "sender": "5511999999999@s.whatsapp.net",
+    "timestamp": "2026-03-28T20:00:00Z",
+    "name": {
+      "name": "New Group Name",
+      "set_by": "5511999999999@s.whatsapp.net"
+    }
+  }
+}
+```
+
+Only the field(s) that actually changed in a given event are present; every other field on the payload is omitted. The possible fields are:
+
+| Field | Present when |
+|---|---|
+| `name` | Group renamed — `{name, set_by}` |
+| `topic` | Topic/description changed or cleared — `{topic, deleted, set_by}` |
+| `locked` | "Only admins can edit group info" toggled — boolean |
+| `announce` | "Only admins can send messages" toggled — boolean |
+| `ephemeral` | Disappearing messages toggled/changed — `{enabled, disappearing_timer_seconds}` |
+| `membership_approval_required` | Membership approval mode toggled — boolean |
+| `deleted` | Group deleted — `{deleted, reason}` |
+| `new_invite_link` | Invite link regenerated |
+| `join` / `leave` / `promote` / `demote` | JIDs who joined, left, were promoted to admin, or were demoted |
+| `suspended` / `unsuspended` | Group suspended/unsuspended |
+
+`sender` is omitted when WhatsApp doesn't report who made the change (e.g. `notify=invite`). Group info events are not persisted and are not replayed by catch-up.
+
+**Push name events (`pushname=true`):** When enabled, a `pushname` payload is pushed whenever a contact's WhatsApp display name changes (detected from an incoming message), regardless of `jids` filtering — a contact's name isn't scoped to one chat:
+
+```json
+{
+  "pushname": {
+    "jid": "5511999999999@s.whatsapp.net",
+    "old_push_name": "John",
+    "new_push_name": "Johnny"
+  }
+}
+```
+
+Push name events are not persisted and are not replayed by catch-up.
 
 ---
 

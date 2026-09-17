@@ -282,6 +282,16 @@ func main() {
 				State:    string(v.State),
 			})
 
+		case *events.GroupInfo:
+			broadcaster.BroadcastGroupInfo(buildGroupInfoMessage(v))
+
+		case *events.PushName:
+			broadcaster.BroadcastPushName(PushNameMessage{
+				JID:         v.JID.String(),
+				OldPushName: v.OldPushName,
+				NewPushName: v.NewPushName,
+			})
+
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
@@ -421,6 +431,11 @@ func main() {
 	// Read-only SQL query endpoint for trusted local tooling.
 	if err := initQueryDB(); err != nil {
 		logger.Errorf("Failed to init read-only query database: %v", err)
+	}
+
+	// Cache for /api/contacts/{jid}/avatar.
+	if err := initAvatarDB(); err != nil {
+		logger.Errorf("Failed to init avatar cache database: %v", err)
 	}
 
 	// Start REST API server

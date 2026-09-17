@@ -50,6 +50,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, broad
 	r.Get("/api/chats/{jid}/messages", makeGetMessagesHandler(messageStore))
 	r.Post("/api/query", makeQueryHandler())
 	r.Get("/api/contacts/{jid}/profile-picture", makeGetProfilePictureHandler(client))
+	r.Get("/api/contacts/{jid}/avatar", makeGetAvatarHandler(client))
 	r.Get("/ws/messages", makeWSHandler(broadcaster, registry, messageStore))
 
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -357,6 +358,82 @@ func makeGetProfilePictureHandler(client *whatsmeow.Client) http.HandlerFunc {
 	}
 }
 
+// makeGetAvatarHandler serves the actual profile-picture bytes, backed by
+// avatarDB, so a downstream consumer can drop a stable URL straight into an
+// <img src> and get standard browser HTTP caching (ETag / If-None-Match /
+// 304 / Cache-Control) instead of hitting WhatsApp's servers — and getting a
+// fresh signed CDN URL — on every page view. See avatar.go for the cache
+// freshness/revalidation design and CLAUDE.md for why this is a separate
+// endpoint from /profile-picture rather than a change to it.
+func makeGetAvatarHandler(client *whatsmeow.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		jidStr := urlParamJID(r)
+		if jidStr == "" {
+			http.Error(w, "JID required", http.StatusBadRequest)
+			return
+		}
+
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if avatarDB == nil {
+			http.Error(w, "Avatar cache not initialised", http.StatusServiceUnavailable)
+			return
+		}
+
+		rec, err := getAvatarRecord(jidStr)
+		if err != nil {
+			logger.Errorf("avatar cache lookup failed for %s: %v", jidStr, err)
+			http.Error(w, "Avatar cache error", http.StatusInternalServerError)
+			return
+		}
+
+		now := time.Now()
+		stale := rec == nil || now.Sub(rec.RevalidatedAt) > avatarFreshness
+		if stale {
+			refreshed, rerr := refreshAvatar(r.Context(), client, jidStr, jid, rec, now)
+			if rerr != nil {
+				if refreshed == nil && rec == nil {
+					// No cache at all and WhatsApp failed (including the
+					// hang case, bounded by avatarFetchTimeout) — nothing
+					// to fall back to.
+					logger.Errorf("avatar fetch failed for %s: %v", jidStr, rerr)
+					http.Error(w, fmt.Sprintf("Failed to get profile picture: %v", rerr), http.StatusBadGateway)
+					return
+				}
+				// Serving what we already had beats a hard failure for
+				// something as low-stakes as an avatar image.
+				logger.Warnf("avatar revalidation failed for %s, serving stale cache: %v", jidStr, rerr)
+			} else {
+				rec = refreshed
+			}
+		}
+
+		maxAge := int(avatarBrowserMaxAge.Seconds())
+
+		if rec == nil || !rec.HasPicture {
+			w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", maxAge))
+			http.Error(w, "No profile picture", http.StatusNotFound)
+			return
+		}
+
+		etag := `"` + rec.PictureID + `"`
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", fmt.Sprintf("private, max-age=%d", maxAge))
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		w.Header().Set("Content-Type", rec.ContentType)
+		w.WriteHeader(http.StatusOK)
+		w.Write(rec.Data)
+	}
+}
+
 // sendAndTrack sends a message and updates the client's last-seen timestamp
 // for the given JID bucket (see ClientRegistry for what the bucket means).
 func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientRegistry, clientName, jidKey string, msg BroadcastMessage) error {
@@ -403,6 +480,32 @@ func sendTypingToClient(ctx context.Context, conn *websocket.Conn, msg TypingMes
 	return err
 }
 
+// sendGroupInfoToClient marshals a group-info update, wrapped under a
+// "groupinfo" key, and writes it to conn. Returns an error if writing fails.
+func sendGroupInfoToClient(ctx context.Context, conn *websocket.Conn, msg GroupInfoMessage) error {
+	data, err := json.Marshal(map[string]GroupInfoMessage{"groupinfo": msg})
+	if err != nil {
+		return nil // skip un-marshallable messages
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err = conn.Write(writeCtx, websocket.MessageText, data)
+	cancel()
+	return err
+}
+
+// sendPushNameToClient marshals a push-name update, wrapped under a
+// "pushname" key, and writes it to conn. Returns an error if writing fails.
+func sendPushNameToClient(ctx context.Context, conn *websocket.Conn, msg PushNameMessage) error {
+	data, err := json.Marshal(map[string]PushNameMessage{"pushname": msg})
+	if err != nil {
+		return nil // skip un-marshallable messages
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	err = conn.Write(writeCtx, websocket.MessageText, data)
+	cancel()
+	return err
+}
+
 func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, store *MessageStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		clientName := r.URL.Query().Get("client_name")
@@ -425,7 +528,9 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 			}
 		}
 		wantTyping := r.URL.Query().Get("typing") == "true"
-		logger.Infof("WS parameters: client=%q jids=%v (%d channels) typing=%v", clientName, channelsStr, len(channels), wantTyping)
+		wantGroupInfo := r.URL.Query().Get("groupinfo") == "true"
+		wantPushName := r.URL.Query().Get("pushname") == "true"
+		logger.Infof("WS parameters: client=%q jids=%v (%d channels) typing=%v groupinfo=%v pushname=%v", clientName, channelsStr, len(channels), wantTyping, wantGroupInfo, wantPushName)
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			OriginPatterns: []string{"*"},
@@ -479,9 +584,13 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 			logger.Infof("WS catch-up complete: client=%q", clientName)
 		}
 
-		ch, typingCh := broadcaster.Subscribe(channels, wantTyping)
+		ch, typingCh, groupInfoCh, pushNameCh := broadcaster.Subscribe(channels, SubscribeOptions{
+			WantTyping:    wantTyping,
+			WantGroupInfo: wantGroupInfo,
+			WantPushName:  wantPushName,
+		})
 		defer broadcaster.Unsubscribe(ch)
-		logger.Infof("WS subscribed to broadcaster: client=%q channels=%v typing=%v", clientName, channels, wantTyping)
+		logger.Infof("WS subscribed to broadcaster: client=%q channels=%v typing=%v groupinfo=%v pushname=%v", clientName, channels, wantTyping, wantGroupInfo, wantPushName)
 
 		for {
 			select {
@@ -515,6 +624,32 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				logger.Debugf("WS received typing: client=%q chat=%q jid=%s state=%s fromMe=%v", clientName, tmsg.ChatJID, tmsg.JID, tmsg.State, tmsg.IsFromMe)
 				if err := sendTypingToClient(ctx, conn, tmsg); err != nil {
 					logger.Warnf("WS sendTypingToClient error: client=%q chat=%q err=%v", clientName, tmsg.ChatJID, err)
+					return
+				}
+			// A nil groupInfoCh (wantGroupInfo == false) is never ready, so
+			// this case simply never fires for clients that didn't opt in.
+			case gimsg, ok := <-groupInfoCh:
+				if !ok {
+					logger.Warnf("WS groupinfo broadcaster channel closed: client=%q", clientName)
+					conn.Close(websocket.StatusNormalClosure, "broadcaster closed")
+					return
+				}
+				logger.Debugf("WS received groupinfo: client=%q chat=%q", clientName, gimsg.ChatJID)
+				if err := sendGroupInfoToClient(ctx, conn, gimsg); err != nil {
+					logger.Warnf("WS sendGroupInfoToClient error: client=%q chat=%q err=%v", clientName, gimsg.ChatJID, err)
+					return
+				}
+			// A nil pushNameCh (wantPushName == false) is never ready, so
+			// this case simply never fires for clients that didn't opt in.
+			case pnmsg, ok := <-pushNameCh:
+				if !ok {
+					logger.Warnf("WS pushname broadcaster channel closed: client=%q", clientName)
+					conn.Close(websocket.StatusNormalClosure, "broadcaster closed")
+					return
+				}
+				logger.Debugf("WS received pushname: client=%q jid=%s", clientName, pnmsg.JID)
+				if err := sendPushNameToClient(ctx, conn, pnmsg); err != nil {
+					logger.Warnf("WS sendPushNameToClient error: client=%q jid=%s err=%v", clientName, pnmsg.JID, err)
 					return
 				}
 			}

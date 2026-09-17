@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"sync"
 	"time"
+
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // BroadcastMessage is the payload sent to WebSocket subscribers for each
@@ -26,14 +29,135 @@ type TypingMessage struct {
 	State    string `json:"state"` // "composing" or "paused"
 }
 
+// GroupInfoMessage is the payload sent to WebSocket subscribers who opted in
+// (groupinfo=true) for a group metadata change: rename, topic, membership,
+// or settings change. Only the field(s) that actually changed in a given
+// event are non-nil/non-empty; everything else is omitted from the JSON.
+type GroupInfoMessage struct {
+	ChatJID   string    `json:"chat_jid"`
+	Sender    string    `json:"sender,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+
+	Name                       *GroupNameChange      `json:"name,omitempty"`
+	Topic                      *GroupTopicChange     `json:"topic,omitempty"`
+	Locked                     *bool                 `json:"locked,omitempty"`
+	Announce                   *bool                 `json:"announce,omitempty"`
+	Ephemeral                  *GroupEphemeralChange `json:"ephemeral,omitempty"`
+	MembershipApprovalRequired *bool                 `json:"membership_approval_required,omitempty"`
+	Deleted                    *GroupDeleteChange    `json:"deleted,omitempty"`
+
+	NewInviteLink *string  `json:"new_invite_link,omitempty"`
+	Join          []string `json:"join,omitempty"`
+	Leave         []string `json:"leave,omitempty"`
+	Promote       []string `json:"promote,omitempty"`
+	Demote        []string `json:"demote,omitempty"`
+	Suspended     bool     `json:"suspended,omitempty"`
+	Unsuspended   bool     `json:"unsuspended,omitempty"`
+}
+
+type GroupNameChange struct {
+	Name  string `json:"name"`
+	SetBy string `json:"set_by,omitempty"`
+}
+
+type GroupTopicChange struct {
+	Topic   string `json:"topic"`
+	Deleted bool   `json:"deleted,omitempty"`
+	SetBy   string `json:"set_by,omitempty"`
+}
+
+type GroupEphemeralChange struct {
+	Enabled                  bool   `json:"enabled"`
+	DisappearingTimerSeconds uint32 `json:"disappearing_timer_seconds,omitempty"`
+}
+
+type GroupDeleteChange struct {
+	Deleted bool   `json:"deleted"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// buildGroupInfoMessage flattens a whatsmeow *events.GroupInfo into the wire
+// format above, converting JIDs to strings (types.JID has no MarshalJSON).
+// Link/Unlink/ParticipantVersionID/UnknownChanges are intentionally omitted —
+// community group-linking plumbing and internal versioning, not meaningful
+// to a downstream consumer.
+func buildGroupInfoMessage(v *events.GroupInfo) GroupInfoMessage {
+	msg := GroupInfoMessage{
+		ChatJID:     v.JID.String(),
+		Timestamp:   v.Timestamp,
+		Join:        jidsToStrings(v.Join),
+		Leave:       jidsToStrings(v.Leave),
+		Promote:     jidsToStrings(v.Promote),
+		Demote:      jidsToStrings(v.Demote),
+		Suspended:   v.Suspended,
+		Unsuspended: v.Unsuspended,
+	}
+	if v.Sender != nil {
+		msg.Sender = v.Sender.String()
+	}
+	if v.Name != nil {
+		msg.Name = &GroupNameChange{Name: v.Name.Name, SetBy: v.Name.NameSetBy.String()}
+	}
+	if v.Topic != nil {
+		msg.Topic = &GroupTopicChange{Topic: v.Topic.Topic, Deleted: v.Topic.TopicDeleted, SetBy: v.Topic.TopicSetBy.String()}
+	}
+	if v.Locked != nil {
+		msg.Locked = &v.Locked.IsLocked
+	}
+	if v.Announce != nil {
+		msg.Announce = &v.Announce.IsAnnounce
+	}
+	if v.Ephemeral != nil {
+		msg.Ephemeral = &GroupEphemeralChange{Enabled: v.Ephemeral.IsEphemeral, DisappearingTimerSeconds: v.Ephemeral.DisappearingTimer}
+	}
+	if v.MembershipApprovalMode != nil {
+		msg.MembershipApprovalRequired = &v.MembershipApprovalMode.IsJoinApprovalRequired
+	}
+	if v.Delete != nil {
+		msg.Deleted = &GroupDeleteChange{Deleted: v.Delete.Deleted, Reason: v.Delete.DeleteReason}
+	}
+	msg.NewInviteLink = v.NewInviteLink
+	return msg
+}
+
+func jidsToStrings(jids []types.JID) []string {
+	if len(jids) == 0 {
+		return nil
+	}
+	out := make([]string, len(jids))
+	for i, j := range jids {
+		out[i] = j.String()
+	}
+	return out
+}
+
+// PushNameMessage is the payload sent to WebSocket subscribers who opted in
+// (pushname=true) for a contact's WhatsApp display-name change.
+type PushNameMessage struct {
+	JID         string `json:"jid"`
+	OldPushName string `json:"old_push_name"`
+	NewPushName string `json:"new_push_name"`
+}
+
+// SubscribeOptions selects which optional live-event streams a WebSocket
+// subscriber wants, alongside the always-on message stream.
+type SubscribeOptions struct {
+	WantTyping    bool
+	WantGroupInfo bool
+	WantPushName  bool
+}
+
 // subscriber holds a WebSocket client's channels and its JID filter.
 // An empty jids slice means no filtering — all messages are delivered.
-// typingCh is nil unless the client opted into typing events, and a nil
-// channel is never selected on, so no extra guarding is needed elsewhere.
+// typingCh/groupInfoCh/pushNameCh are nil unless the client opted into that
+// event stream, and a nil channel is never selected on, so no extra
+// guarding is needed elsewhere.
 type subscriber struct {
-	ch       chan BroadcastMessage
-	typingCh chan TypingMessage
-	jids     []string
+	ch          chan BroadcastMessage
+	typingCh    chan TypingMessage
+	groupInfoCh chan GroupInfoMessage
+	pushNameCh  chan PushNameMessage
+	jids        []string
 }
 
 // MessageBroadcaster fan-outs incoming messages to all connected WebSocket
@@ -52,31 +176,43 @@ func NewMessageBroadcaster() *MessageBroadcaster {
 
 // Subscribe registers a new subscriber and returns its receive channels.
 // If jids is non-empty, only messages matching those JIDs are delivered.
-// The typing channel is nil unless wantTyping is true. The caller must call
-// Unsubscribe when done to avoid a goroutine/channel leak.
-func (b *MessageBroadcaster) Subscribe(jids []string, wantTyping bool) (chan BroadcastMessage, chan TypingMessage) {
-	ch := make(chan BroadcastMessage, 64)
-	var typingCh chan TypingMessage
-	if wantTyping {
+// Each optional channel is nil unless the corresponding opts field is true.
+// The caller must call Unsubscribe when done to avoid a goroutine/channel leak.
+func (b *MessageBroadcaster) Subscribe(jids []string, opts SubscribeOptions) (
+	ch chan BroadcastMessage, typingCh chan TypingMessage,
+	groupInfoCh chan GroupInfoMessage, pushNameCh chan PushNameMessage,
+) {
+	ch = make(chan BroadcastMessage, 64)
+	if opts.WantTyping {
 		typingCh = make(chan TypingMessage, 64)
 	}
+	if opts.WantGroupInfo {
+		groupInfoCh = make(chan GroupInfoMessage, 64)
+	}
+	if opts.WantPushName {
+		pushNameCh = make(chan PushNameMessage, 64)
+	}
 	b.mu.Lock()
-	b.clients[&subscriber{ch: ch, typingCh: typingCh, jids: jids}] = struct{}{}
+	b.clients[&subscriber{ch: ch, typingCh: typingCh, groupInfoCh: groupInfoCh, pushNameCh: pushNameCh, jids: jids}] = struct{}{}
 	b.mu.Unlock()
-	return ch, typingCh
+	return ch, typingCh, groupInfoCh, pushNameCh
 }
 
-// Unsubscribe removes the channel from the subscriber map and closes it
-// (and its typing channel, if any). The delete happens before the close so
-// that a concurrent Broadcast call (holding only a read-lock over the same
-// map snapshot) will never see the already-closed channel.
+// Unsubscribe removes the channel from the subscriber map and closes it and
+// its optional channels, if any. The delete happens before the close so that
+// a concurrent Broadcast call (holding only a read-lock over the same map
+// snapshot) will never see the already-closed channel.
 func (b *MessageBroadcaster) Unsubscribe(ch chan BroadcastMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var typingCh chan TypingMessage
+	var groupInfoCh chan GroupInfoMessage
+	var pushNameCh chan PushNameMessage
 	for sub := range b.clients {
 		if sub.ch == ch {
 			typingCh = sub.typingCh
+			groupInfoCh = sub.groupInfoCh
+			pushNameCh = sub.pushNameCh
 			delete(b.clients, sub)
 			break
 		}
@@ -84,6 +220,12 @@ func (b *MessageBroadcaster) Unsubscribe(ch chan BroadcastMessage) {
 	close(ch)
 	if typingCh != nil {
 		close(typingCh)
+	}
+	if groupInfoCh != nil {
+		close(groupInfoCh)
+	}
+	if pushNameCh != nil {
+		close(pushNameCh)
 	}
 }
 
@@ -146,6 +288,46 @@ func (b *MessageBroadcaster) BroadcastTyping(msg TypingMessage) {
 		case sub.typingCh <- msg:
 		default:
 			logger.Warnf("BroadcastTyping dropped: chat=%q subscriber buffer full", msg.ChatJID)
+		}
+	}
+}
+
+// BroadcastGroupInfo delivers a group metadata change to subscribers who
+// opted into group-info events and whose JID filter (if any) matches the
+// group. Sends are non-blocking, same as Broadcast.
+func (b *MessageBroadcaster) BroadcastGroupInfo(msg GroupInfoMessage) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	for sub := range b.clients {
+		if sub.groupInfoCh == nil || !b.jidMatches(sub, msg.ChatJID) {
+			continue
+		}
+		select {
+		case sub.groupInfoCh <- msg:
+		default:
+			logger.Warnf("BroadcastGroupInfo dropped: chat=%q subscriber buffer full", msg.ChatJID)
+		}
+	}
+}
+
+// BroadcastPushName delivers a contact display-name change to every
+// subscriber who opted into push-name events. Unlike Broadcast/BroadcastTyping
+// there is no chat JID to filter on — a contact's name isn't scoped to one
+// chat — so every push-name subscriber receives it. Sends are non-blocking,
+// same as Broadcast.
+func (b *MessageBroadcaster) BroadcastPushName(msg PushNameMessage) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	for sub := range b.clients {
+		if sub.pushNameCh == nil {
+			continue
+		}
+		select {
+		case sub.pushNameCh <- msg:
+		default:
+			logger.Warnf("BroadcastPushName dropped: jid=%q subscriber buffer full", msg.JID)
 		}
 	}
 }

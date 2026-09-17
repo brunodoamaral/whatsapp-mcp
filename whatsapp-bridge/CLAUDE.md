@@ -88,6 +88,91 @@ WS handler's `select` never fires on a nil channel — so a client that didn't
 ask for typing events pays no cost (no allocation, no wasted sends) rather
 than receiving-and-discarding.
 
+## `GET /api/contacts/{jid}/avatar` (`avatar.go`)
+
+**Why a second endpoint instead of changing `/profile-picture`.** The
+existing JSON endpoint (`handlers.go::makeGetProfilePictureHandler`) calls
+`client.GetProfilePictureInfo` fresh on every request and returns a
+short-lived signed WhatsApp CDN `url` — a different URL each time even when
+the photo hasn't changed, so a downstream browser can never cache it by URL,
+and some JIDs are observed to hang on that full fetch, stalling whoever
+called synchronously. A downstream consumer (a Python/FastAPI app rendering
+`<img>` tags) needed a URL that is itself stable and standard-HTTP-cacheable.
+Changing `/profile-picture`'s response shape would break whatever already
+depends on its documented JSON contract (grepped for other callers — none in
+this repo, but the contract is public API per `API.md`), so it stays exactly
+as-is and the new behavior lives at its own path, serving raw image bytes
+instead of JSON.
+
+**Cache table (`store/avatars.db`, its own SQLite file, not a table bolted
+onto `messages.db`/`whatsapp.db`).** Everything in it is disposable/derived
+— re-fetchable from WhatsApp at any time — so it doesn't belong in either of
+the two databases whose loss would actually be a problem. Schema:
+
+```sql
+CREATE TABLE avatars (
+    jid            TEXT PRIMARY KEY,
+    picture_id     TEXT NOT NULL DEFAULT '',  -- whatsmeow's stable id; '' when has_picture is false
+    content_type   TEXT NOT NULL DEFAULT '',
+    data           BLOB,
+    has_picture    BOOLEAN NOT NULL DEFAULT 0,
+    fetched_at     TIMESTAMP NOT NULL,        -- when the bytes/absence were last actually established
+    revalidated_at TIMESTAMP NOT NULL         -- when we last confirmed that's still current
+);
+```
+
+A JID with no photo (`ErrProfilePictureNotSet`) — or whose owner has hidden
+it from us (`ErrProfilePictureUnauthorized`) — is cached the same way, with
+`has_picture = 0` and no bytes, specifically so repeatedly requesting a
+contact with no photo doesn't hit WhatsApp on every request. This doesn't
+need the `SetMaxOpenConns(1)`/`ATTACH` discipline `store.go`/`query.go` rely
+on — there's no cross-database join here — but it's set anyway since the
+table is low-traffic and a single writer costs nothing.
+
+**Freshness window: 6 hours before even a cheap revalidation call, 1 hour of
+browser-side `Cache-Control`.** Profile pictures change far less often than
+messages, so `avatarFreshness` (6h) means at most 4 round-trips to WhatsApp
+per contact per day under continuous traffic, while still catching a changed
+photo the same day. Past that window the bridge still doesn't re-download
+anything by default — it revalidates via whatsmeow's existing
+`ExistingID`/`known_id` mechanism (already wired into `/profile-picture` but
+previously unused by any caller), which returns "unchanged" without
+resending image bytes; a full re-download only happens when whatsmeow
+reports the photo actually changed, or there's no cache yet for that JID.
+`avatarBrowserMaxAge` (1h) is deliberately shorter than the 6h server-side
+window: once a browser's cached copy expires, its next request carries
+`If-None-Match`, which lands well inside the 6h window and gets answered
+`304` straight from `avatars.db` — the common case never reaches WhatsApp.
+
+**The whatsmeow call and the CDN download both run under a 10s timeout
+(`avatarFetchTimeout`), and a timeout falls back to serving stale cache
+rather than failing the request.** This was explicitly called out as an
+observed failure mode (some JIDs hang on the full profile-picture fetch) —
+without a bound, a slow/hung JID would stall the HTTP handler (and whatever
+downstream `<img>` load is waiting on it) indefinitely. Since an avatar a few
+hours stale is a non-issue for a downstream UI, "serve what we already have"
+beats "5xx and make the browser show a broken image" whenever there's
+something in the cache to fall back to; only a JID with *no* cache at all and
+a failing/timing-out WhatsApp call gets a real error (502).
+
+**ETag / If-None-Match / 304 / Cache-Control, the standard HTTP way.** The
+`ETag` is the picture's whatsmeow `id` (the same value the JSON endpoint
+calls `id`, and the same thing `known_id`/`ExistingID` round-trips) quoted
+per RFC. A matching `If-None-Match` gets a bodyless `304`. `Cache-Control` is
+`private` — this is single-consumer image data, not something a shared/CDN
+cache should hold — with `max-age` set to `avatarBrowserMaxAge`. The 404
+("no photo") response also carries the same `Cache-Control`, so a browser
+stops asking for a contact with no photo for the same window rather than
+retrying on every page load.
+
+**Route registration mirrors `/profile-picture`** —
+`r.Get("/api/contacts/{jid}/avatar", makeGetAvatarHandler(client))` in
+`handlers.go`'s `startRESTServer`, using the same `urlParamJID` percent-decode
+helper. `initAvatarDB()` is called from `main.go` right after `initQueryDB()`,
+logging (not fataling) on failure — consistent with how the query DB's init
+failure is handled, since neither endpoint is required for the bridge's core
+job of relaying messages.
+
 ## Not done, on purpose
 
 Row-level or query-level auth/audit beyond "not intended to be reachable
