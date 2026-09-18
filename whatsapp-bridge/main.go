@@ -301,8 +301,12 @@ func main() {
 			// chat-presence (typing/paused) updates at all — see
 			// events.ChatPresence below — and as a side effect enables
 			// active read receipts. This does make the account show as
-			// "online" to contacts.
-			if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+			// "online" to contacts. Set DISABLE_AUTO_ONLINE=1 to skip this
+			// (chat-presence/typing events won't fire, and the account
+			// won't show as online).
+			if os.Getenv("DISABLE_AUTO_ONLINE") == "1" {
+				logger.Infof("Skipping automatic online presence (DISABLE_AUTO_ONLINE=1)")
+			} else if err := client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
 				logger.Warnf("Failed to send available presence: %v", err)
 			}
 
