@@ -450,8 +450,10 @@ func main() {
 	audioPipeline.Start()
 	defer audioPipeline.Stop()
 
-	// Optional FUZZY_BOOST override for /api/search typo weighting.
+	// Optional FUZZY_BOOST / FUZZY_LENGTH_SCALE overrides for /api/search
+	// typo weighting.
 	loadFuzzyBoostOverride()
+	loadFuzzyLengthScaleOverride()
 
 	// Read-only SQL query endpoint for trusted local tooling.
 	if err := initQueryDB(); err != nil {

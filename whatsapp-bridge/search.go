@@ -146,6 +146,14 @@ type fuzzyTerm struct {
 	freq uint64
 }
 
+// fuzzyToken is one analyzed query token together with the index terms it
+// expanded to. The token is kept because its length decides how much weight
+// its near-misses deserve — see fuzzyLengthScale.
+type fuzzyToken struct {
+	token    string
+	variants []fuzzyTerm
+}
+
 // analyzeQueryTokens runs queryStr through the same analyzer the field uses at
 // index time, so the resulting tokens are directly comparable to index terms.
 // Hand-tokenizing would skip to_lower/ascii_folding/stop_pt/stemmer_pt_light
@@ -175,7 +183,7 @@ func analyzeQueryTokens(index bleve.Index, queryStr string) []string {
 // zeroed out relative to tokens with small ones. Expanding here lets the
 // caller put every variant in a single flat disjunction with one shared
 // denominator, which cancels.
-func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness int) ([][]fuzzyTerm, int, error) {
+func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness int) ([]fuzzyToken, int, error) {
 	adv, err := idx.Advanced()
 	if err != nil {
 		return nil, 0, fmt.Errorf("advanced index unavailable: %w", err)
@@ -191,7 +199,7 @@ func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness 
 		return nil, 0, fmt.Errorf("index reader does not support fuzzy dictionaries")
 	}
 
-	expanded := make([][]fuzzyTerm, 0, len(tokens))
+	expanded := make([]fuzzyToken, 0, len(tokens))
 	total := 0
 	for _, token := range tokens {
 		dist := fuzziness
@@ -200,7 +208,7 @@ func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness 
 		}
 		if dist <= 0 {
 			// Too short to be worth an edit; the token itself is the only variant.
-			expanded = append(expanded, []fuzzyTerm{{term: token}})
+			expanded = append(expanded, fuzzyToken{token: token, variants: []fuzzyTerm{{term: token}}})
 			total++
 			continue
 		}
@@ -220,7 +228,7 @@ func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness 
 			// matches what fuzziness=0 would have returned (no hits).
 			variants = []fuzzyTerm{{term: token}}
 		}
-		expanded = append(expanded, variants)
+		expanded = append(expanded, fuzzyToken{token: token, variants: variants})
 		total += len(variants)
 	}
 	return expanded, total, nil
@@ -284,12 +292,36 @@ func fuzzyDictTerms(reader index.IndexReaderFuzzy, field, token string, dist int
 // these weights: when the query's spelling is absent from the index every
 // candidate is fuzzy, so the shared factor cancels and the best true spelling
 // still lands at rank 1. The weights only govern how much fuzzy hits disturb
-// exact ones, so low is strictly better, and the guard metrics flatten out at
-// roughly these values.
+// exact ones. Above these values they start to: at 0.25 a fuzzy hit displaces
+// a real "predisin" match out of the top ten.
 //
-// Overridable at runtime with FUZZY_BOOST, since the right answer depends on
-// how often a one-edit neighbour is a typo rather than a word of its own.
-var fuzzyDistanceBoost = [maxFuzziness + 1]float64{1.0, 0.03, 0.01}
+// These are the weights for a *long* token; fuzzyLengthScale cuts them down
+// for short ones, which is what keeps "bola" away from a query for "bolo".
+//
+// Overridable at runtime with FUZZY_BOOST.
+var fuzzyDistanceBoost = [maxFuzziness + 1]float64{1.0, 0.12, 0.04}
+
+// fuzzyLengthScale scales a near-miss by the length of the query token it came
+// from, indexed by that length and clamped at the final entry.
+//
+// The longer the word, the likelier a near-miss is a misspelling rather than a
+// different word. At four characters the edit-distance-1 neighbourhood is
+// mostly real vocabulary — bolo/bola/bolo/polo/bobo — so a neighbour there
+// says almost nothing. At nine or ten characters practically nothing but typos
+// lands within one edit, so the neighbour is worth taking seriously. This is a
+// separate axis from bleve's auto-fuzziness, which uses length to pick how far
+// to search; this decides how much to trust what it finds.
+//
+// The lengths are of the *stemmed* token, which is what actually gets
+// expanded. Portuguese light stemming shortens aggressively ("obrigado" ->
+// "obrig"), and the stem is the right unit because it is the stem's
+// neighbourhood being walked.
+//
+// Overridable at runtime with FUZZY_LENGTH_SCALE.
+var fuzzyLengthScale = []float64{
+	// 0    1    2    3     4     5     6     7     8+
+	0, 0, 0, 0.10, 0.20, 0.40, 0.70, 0.90, 1.0,
+}
 
 // loadFuzzyBoostOverride lets FUZZY_BOOST="1,0.12,0.04" retune the decay
 // without a rebuild. What the right weights are depends on the corpus — how
@@ -318,6 +350,32 @@ func loadFuzzyBoostOverride() {
 	logger.Infof("Fuzzy distance boosts overridden: %v", fuzzyDistanceBoost)
 }
 
+// loadFuzzyLengthScaleOverride lets FUZZY_LENGTH_SCALE="0,0,0,0.1,..." retune
+// the length curve without a rebuild. Entry i is the weight for a token of
+// length i; the last entry covers everything longer.
+func loadFuzzyLengthScaleOverride() {
+	raw := os.Getenv("FUZZY_LENGTH_SCALE")
+	if raw == "" {
+		return
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) < 2 {
+		logger.Warnf("Ignoring FUZZY_LENGTH_SCALE=%q: need at least 2 weights", raw)
+		return
+	}
+	parsed := make([]float64, len(parts))
+	for i, part := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil || v < 0 {
+			logger.Warnf("Ignoring FUZZY_LENGTH_SCALE=%q: bad weight %q", raw, part)
+			return
+		}
+		parsed[i] = v
+	}
+	fuzzyLengthScale = parsed
+	logger.Infof("Fuzzy length scale overridden: %v", fuzzyLengthScale)
+}
+
 // buildFuzzyTextQuery turns the expanded terms into one flat disjunction.
 //
 // Flat is the whole point. When bleve expands fuzziness itself it nests a
@@ -330,22 +388,46 @@ func loadFuzzyBoostOverride() {
 // squared clause weights) and each weight is (boost*idf)^2. Multiplying every
 // boost by the clause count to undo the coord division was tried and provably
 // does nothing. Absolute scale is handled in normalizeHitScores instead.
-func buildFuzzyTextQuery(expanded [][]fuzzyTerm, field string) query.Query {
+func buildFuzzyTextQuery(expanded []fuzzyToken, field string) query.Query {
 	disjunction := bleve.NewDisjunctionQuery()
 	disjunction.SetMin(1)
-	for _, variants := range expanded {
-		for _, v := range variants {
-			boost := fuzzyDistanceBoost[len(fuzzyDistanceBoost)-1]
-			if int(v.dist) < len(fuzzyDistanceBoost) {
-				boost = fuzzyDistanceBoost[v.dist]
-			}
+	for _, ft := range expanded {
+		scale := fuzzyLengthScaleFor(len(ft.token))
+		for _, v := range ft.variants {
 			tq := bleve.NewTermQuery(v.term)
 			tq.SetField(field)
-			tq.SetBoost(boost)
+			tq.SetBoost(fuzzyVariantBoost(v.dist, scale))
 			disjunction.AddQuery(tq)
 		}
 	}
 	return disjunction
+}
+
+// fuzzyVariantBoost combines the edit-distance weight with the length scale of
+// the token the variant came from. An exact term (distance 0) is never scaled
+// down — the length rule is about how much to trust a *near*-miss.
+func fuzzyVariantBoost(dist uint8, lengthScale float64) float64 {
+	base := fuzzyDistanceBoost[len(fuzzyDistanceBoost)-1]
+	if int(dist) < len(fuzzyDistanceBoost) {
+		base = fuzzyDistanceBoost[dist]
+	}
+	if dist == 0 {
+		return base
+	}
+	return base * lengthScale
+}
+
+// fuzzyLengthScaleFor indexes fuzzyLengthScale by token length, clamping to
+// the last entry. Tokens are ascii-folded by the analyzer, so byte length is
+// character length here.
+func fuzzyLengthScaleFor(n int) float64 {
+	if n < 0 {
+		n = 0
+	}
+	if n >= len(fuzzyLengthScale) {
+		n = len(fuzzyLengthScale) - 1
+	}
+	return fuzzyLengthScale[n]
 }
 
 // debugLogContext logs a context group at DEBUG level (no-op when logger is above DEBUG).

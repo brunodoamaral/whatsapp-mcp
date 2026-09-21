@@ -82,13 +82,18 @@ edit distance only has to absorb real misspellings. `auto` means edit distance
 first character of a term must always match. Distance is Damerau, so a
 transposition (`aline` / `alien`) counts as one edit, not two.
 
-Fuzzy hits are weighted far below exact ones (0.03 at edit distance 1, 0.01 at
-2), so turning fuzziness on appends near-misses beneath the exact matches
-rather than reordering them — an edit-distance-1 neighbour is as often a
-different word (`bolo` / `bola`) as a typo. This costs nothing in recall: when
-the spelling you typed is absent from the index, every candidate is fuzzy and
-the best true spelling still ranks first. The weights are overridable with the
-`FUZZY_BOOST=1,0.03,0.01` environment variable. Values above 2 are clamped.
+Fuzzy hits are weighted well below exact ones (0.12 at edit distance 1, 0.04
+at 2) and are scaled down further for short words — from 0.10x at three
+characters up to 1x at eight or more, measured on the stemmed term. A one-edit
+neighbour of a short word is usually a different word (`bolo` / `bola`) rather
+than a typo, while for a long word it is almost always a misspelling. Turning
+fuzziness on therefore appends near-misses beneath the exact matches instead
+of reordering them. This costs nothing in recall: when the spelling you typed
+is absent from the index, every candidate is fuzzy and the best true spelling
+still ranks first. Both tables are overridable with the
+`FUZZY_BOOST=1,0.12,0.04` and
+`FUZZY_LENGTH_SCALE=0,0,0,0.1,0.2,0.4,0.7,0.9,1` environment variables.
+Values above 2 are clamped.
 
 Scores are normalized so the best hit in a response is always `1.0` and the
 rest are relative to it. Raw BM25 scores are not comparable between queries,

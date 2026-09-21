@@ -216,45 +216,60 @@ index reader does not implement `IndexReaderFuzzy`, or the walk fails, the
 code falls back to `MatchQuery` fuzziness and logs a warning — skewed scoring
 beats no search.
 
-**`fuzzyDistanceBoost` makes variants near-weightless (1.0 / 0.03 / 0.01),
-not `1/(editDistance+1)`.** Fuzzy matching is a fallback for when the spelling
-the user typed is absent from the index — not a competitor to the spelling
-that is there. Two things make a gentle decay actively wrong:
+**Near-misses are weighted by edit distance *and* by the length of the token
+they came from** — `fuzzyDistanceBoost` (1.0 / 0.12 / 0.04) scaled by
+`fuzzyLengthScale`, which ramps from 0.10 at three characters to 1.0 at eight
+or more. Fuzzy matching is a fallback for when the spelling the user typed is
+absent from the index, not a competitor to the spelling that is there.
 
-- `coord` is `matchedTerms/clauseCount`, so a document is *rewarded* for
-  holding several different misspellings of the query word, and `coord` is
-  per-document so no boost can cancel it. At `1/(dist+1)`, searching
-  `predisin` put a document holding `predsim` and `predsin` at rank 1, above
-  the nine documents that actually contain `predisin`.
-- An edit-distance-1 neighbour is frequently a *different word*, not a typo —
-  `bolo`/`bola`, `aline`/`alien` — and nothing about the distance separates
-  the two cases. At `1/(dist+1)` a query for cake returned `bola` (ball) at
-  rank 2.
+The length rule exists because **an edit-distance-1 neighbour of a short word
+is usually a different word, not a typo**. At four characters the
+neighbourhood is ordinary vocabulary — `bolo`/`bola`/`polo`/`bobo` — so a
+neighbour says almost nothing; at nine or ten characters practically nothing
+but misspellings lands within one edit. This is a separate axis from bleve's
+auto-fuzziness, which uses length to decide how far to search; this decides
+how much to trust what it finds. Lengths are of the *stemmed* token, since
+that is what gets expanded — `stemmer_pt_light` strips a trailing vowel above
+four characters, so `obrigado` → `obrigad` (7, nearly full weight) while
+`aline` → `alin` (4, heavily discounted).
 
-**Recall does not depend on these weights, which is what makes the tuning
-one-sided.** When the query's spelling is absent from the index every
+A flat decay was wrong in both directions. `1/(editDistance+1)` was far too
+generous: `coord` is `matchedTerms/clauseCount`, so a document is *rewarded*
+for holding several different misspellings of the query word — and `coord` is
+per-document, so no boost can cancel it. Searching `predisin` put a document
+holding `predsim` and `predsin` at rank 1, above the nine documents that
+actually contain `predisin`. A flat 0.03/0.01 fixed that but then under-served
+long words, where a near-miss really is a typo.
+
+**Recall does not depend on any of these weights, which is what makes the
+tuning one-sided.** When the query's spelling is absent from the index every
 candidate is fuzzy, so the shared weight cancels out of the ranking and the
-best true spelling lands at rank 1 regardless. Swept over 1/0.5/0.25 down to
+best true spelling lands at rank 1 regardless. Swept from 1/0.5/0.25 down to
 1/0.01/0.003, the recall probes (`predisim`, `anivrsario`, `alien`,
-`obrigadu`) returned rank 1 at *every* setting. The weights only govern how
-much fuzzy hits disturb exact ones, so low is strictly better; the guard
-metrics flatten out around 0.03/0.01 and gain nothing below it.
+`obrigadu`, `bolu`) returned rank 1 at *every* setting. So the weights only
+trade against displacement of exact matches, and 0.12/0.04 is where that
+flattens: at 0.25 a fuzzy hit pushes a real `predisin` match out of the top
+ten.
 
-At the chosen values every guard case matches its `fuzziness=0` baseline:
-`predisin` keeps ranks 1–9 exact and appends a fuzzy hit at 10 (it only has
-nine exact matches); `bolo` and `aniversario` are unchanged with `bola` first
-appearing at rank 17; `aline` is unchanged with `alien` reachable at 11 where
-it was previously unreachable; and querying the typo `alien` promotes `aline`
-from rank 2 to 1.
+At the chosen values every guard case sits at its `fuzziness=0` floor —
+`predisin`, `bolo`, `aline`, `obrigado` and `aniversario` all show no
+non-matching document in the top ten that was not already there without
+fuzziness. `predisin` gains one at rank 10 simply because it has only nine
+exact matches to fill the page.
 
-**`FUZZY_BOOST` overrides the weights at runtime** (`FUZZY_BOOST=1,0.03,0.01`,
-read in `loadFuzzyBoostOverride` and called from `main.go` alongside the other
-init steps), because the right answer depends on how often a one-edit
-neighbour in a given corpus is a typo rather than a word of its own. Note
-that `systemctl --user set-environment` is enough to change it — no rebuild.
-Note also that scorch builds its Levenshtein automaton with
-`transposition=true`, so it is Damerau distance: `aline`→`alien` is one edit,
-not two.
+A caution on metrics: measure "is this an exact match" against the *stem*, not
+the literal word. Counting `obrigado` alone made `obrigada` documents look
+like fuzzy intrusions and sent an earlier tuning round chasing a problem that
+did not exist.
+
+**`FUZZY_BOOST` and `FUZZY_LENGTH_SCALE` override both tables at runtime**
+(`FUZZY_BOOST=1,0.12,0.04`, `FUZZY_LENGTH_SCALE=0,0,0,0.1,0.2,0.4,0.7,0.9,1`;
+the last length entry covers everything longer). Parsed in
+`loadFuzzyBoostOverride` / `loadFuzzyLengthScaleOverride`, called from
+`main.go`. `systemctl --user set-environment` plus a restart is enough — no
+rebuild, which is how the sweeps above were run. Note also that scorch builds
+its Levenshtein automaton with `transposition=true`, so it is Damerau
+distance: `aline`→`alien` is one edit, not two.
 
 **Boosts cannot restore the lost magnitude; normalization does.** The obvious
 fix for the collapse — boosting every clause by the clause count so `coord`
