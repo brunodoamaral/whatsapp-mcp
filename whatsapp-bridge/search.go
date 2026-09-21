@@ -261,22 +261,42 @@ func fuzzyDictTerms(reader index.IndexReaderFuzzy, field, token string, dist int
 	return variants, nil
 }
 
+// fuzzyDistanceBoost weights a variant by its edit distance from the query
+// term. The decay is far steeper than the obvious 1/(dist+1) because bleve's
+// disjunction scorer multiplies each document's summed score by
+// coord = matchedTerms/clauseCount — so a document is *rewarded* for holding
+// several different misspellings of the query word. With a gentle decay that
+// reward beats an exact match outright: searching "predisin" returned a
+// document holding "predsim" and "predsin" above the nine documents that
+// actually contain "predisin". coord is per-document, so no choice of boosts
+// can cancel it; a steep decay instead makes it impractical for a stack of
+// approximate matches to outvote the real spelling.
+var fuzzyDistanceBoost = [maxFuzziness + 1]float64{1.0, 0.12, 0.04}
+
 // buildFuzzyTextQuery turns the expanded terms into one flat disjunction.
 //
-// Every variant is boosted by total/(dist+1). The disjunction scorer then
-// multiplies the summed score by coord = matchedTerms/total, so total cancels
-// and a document scores sum(bm25(term)/(dist+1)) over the variants it matched
-// — its natural BM25 score for an exact hit, halved at edit distance 1, and so
-// on. Without the total factor every score would be divided by the expansion
-// size, which is what made scores collapse (1.31 -> 0.09 for "aniversario").
-func buildFuzzyTextQuery(expanded [][]fuzzyTerm, total int, field string) query.Query {
+// Flat is the whole point. When bleve expands fuzziness itself it nests a
+// disjunction per token, and each one divides by its own clause count — which
+// differs by two orders of magnitude between tokens in this corpus. One level
+// means one shared denominator, so tokens keep their relative weight.
+//
+// Boosts here are only meaningful relative to each other: a uniform factor
+// across every clause cancels out exactly, because queryNorm is 1/sqrt(sum of
+// squared clause weights) and each weight is (boost*idf)^2. Multiplying every
+// boost by the clause count to undo the coord division was tried and provably
+// does nothing. Absolute scale is handled in normalizeHitScores instead.
+func buildFuzzyTextQuery(expanded [][]fuzzyTerm, field string) query.Query {
 	disjunction := bleve.NewDisjunctionQuery()
 	disjunction.SetMin(1)
 	for _, variants := range expanded {
 		for _, v := range variants {
+			boost := fuzzyDistanceBoost[len(fuzzyDistanceBoost)-1]
+			if int(v.dist) < len(fuzzyDistanceBoost) {
+				boost = fuzzyDistanceBoost[v.dist]
+			}
 			tq := bleve.NewTermQuery(v.term)
 			tq.SetField(field)
-			tq.SetBoost(float64(total) / float64(v.dist+1))
+			tq.SetBoost(boost)
 			disjunction.AddQuery(tq)
 		}
 	}
@@ -850,7 +870,7 @@ func buildTextQuery(idx bleve.Index, queryStr string, fuzziness int) query.Query
 		expanded, total, err := expandFuzzyTerms(idx, "context", tokens, fuzziness)
 		if err == nil && total > 0 {
 			logger.Debugf("Fuzzy expansion: %d token(s) -> %d index terms", len(tokens), total)
-			return buildFuzzyTextQuery(expanded, total, "context")
+			return buildFuzzyTextQuery(expanded, "context")
 		}
 		if err != nil {
 			logger.Warnf("Fuzzy term expansion failed, falling back to match-query fuzziness: %v", err)

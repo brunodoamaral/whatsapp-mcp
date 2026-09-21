@@ -211,11 +211,22 @@ documents matching only `aniversario`, above documents matching both.
 `FieldDictFuzzy` (`DictEntry` already carries `EditDistance` and `Count`, so
 no `FuzzyAutomaton` is needed) and `buildFuzzyTextQuery` puts every variant of
 every token into **one flat disjunction**. The denominator is then a single
-constant shared by all tokens, so the per-token distortion cancels and each
-variant is weighted only by its own `1/(editDistance+1)` boost. If the index
-reader does not implement `IndexReaderFuzzy`, or the walk fails, the code
-falls back to `MatchQuery` fuzziness and logs a warning — skewed scoring beats
-no search.
+constant shared by all tokens, so the per-token distortion cancels. If the
+index reader does not implement `IndexReaderFuzzy`, or the walk fails, the
+code falls back to `MatchQuery` fuzziness and logs a warning — skewed scoring
+beats no search.
+
+**`fuzzyDistanceBoost` decays steeply (1.0 / 0.12 / 0.04), not as
+`1/(editDistance+1)`.** `coord` is `matchedTerms/clauseCount`, so a document
+is *rewarded* for containing several different misspellings of the same query
+word — and because `coord` is per-document, no choice of boosts can cancel
+it. With the gentle `1/(dist+1)` decay this reward beat exact matching
+outright: searching `predisin` put a document holding `predsim` and `predsin`
+at rank 1, above the nine documents that actually contain `predisin`, which
+had been ranks 1–9 before fuzziness existed. The steep decay restores those
+nine to the top and appends the fuzzy hits below them. This corpus makes the
+failure easy to hit — `predsim` (123 messages), `predsin` and `predisin` (9)
+all coexist in it, and people write all three in the same conversation.
 
 **Boosts cannot restore the lost magnitude; normalization does.** The obvious
 fix for the collapse — boosting every clause by the clause count so `coord`
@@ -224,7 +235,7 @@ again: `TermQueryScorer.Weight()` is `(boost·idf)²` and `queryNorm` is
 `1/sqrt(Σ Weight)`, so scaling every boost by the same factor scales
 `queryNorm` down by exactly that factor. A uniform boost inside a disjunction
 always cancels itself out. Boost only ever expresses *relative* weight, which
-is why `1/(editDistance+1)` still does its job. Absolute magnitude is instead
+is why `fuzzyDistanceBoost` still does its job. Absolute magnitude is instead
 restored in `normalizeHitScores`, which divides through by the top score after
 the final sort: `coord` and `queryNorm` are constants for a given query, so
 they never affected ordering, only scale. This also makes the text-only path

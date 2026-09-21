@@ -79,8 +79,9 @@ and Portuguese-light-stemmed — so accent and inflection variants (`remedio` /
 `remédio`, `comprimido` / `comprimidos`) match at `fuzziness=0` already, and the
 edit distance only has to absorb real misspellings. `auto` means edit distance
 2 for terms longer than 5 characters, 1 for 3–5, and 0 for 2 or shorter. The
-first character of a term must always match. Fuzzy hits score
-`1/(editDistance+1)` of an exact hit, so exact matches still rank on top.
+first character of a term must always match. Fuzzy hits are weighted well
+below exact ones (0.12 at edit distance 1, 0.04 at 2), so turning fuzziness on
+appends near-misses beneath the exact matches rather than reordering them.
 Values above 2 are clamped.
 
 Scores are normalized so the best hit in a response is always `1.0` and the
