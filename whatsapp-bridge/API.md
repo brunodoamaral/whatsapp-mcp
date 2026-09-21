@@ -79,10 +79,16 @@ and Portuguese-light-stemmed — so accent and inflection variants (`remedio` /
 `remédio`, `comprimido` / `comprimidos`) match at `fuzziness=0` already, and the
 edit distance only has to absorb real misspellings. `auto` means edit distance
 2 for terms longer than 5 characters, 1 for 3–5, and 0 for 2 or shorter. The
-first character of a term must always match. Fuzzy hits are weighted well
-below exact ones (0.12 at edit distance 1, 0.04 at 2), so turning fuzziness on
-appends near-misses beneath the exact matches rather than reordering them.
-Values above 2 are clamped.
+first character of a term must always match. Distance is Damerau, so a
+transposition (`aline` / `alien`) counts as one edit, not two.
+
+Fuzzy hits are weighted far below exact ones (0.03 at edit distance 1, 0.01 at
+2), so turning fuzziness on appends near-misses beneath the exact matches
+rather than reordering them — an edit-distance-1 neighbour is as often a
+different word (`bolo` / `bola`) as a typo. This costs nothing in recall: when
+the spelling you typed is absent from the index, every candidate is fuzzy and
+the best true spelling still ranks first. The weights are overridable with the
+`FUZZY_BOOST=1,0.03,0.01` environment variable. Values above 2 are clamped.
 
 Scores are normalized so the best hit in a response is always `1.0` and the
 rest are relative to it. Raw BM25 scores are not comparable between queries,

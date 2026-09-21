@@ -216,17 +216,45 @@ index reader does not implement `IndexReaderFuzzy`, or the walk fails, the
 code falls back to `MatchQuery` fuzziness and logs a warning — skewed scoring
 beats no search.
 
-**`fuzzyDistanceBoost` decays steeply (1.0 / 0.12 / 0.04), not as
-`1/(editDistance+1)`.** `coord` is `matchedTerms/clauseCount`, so a document
-is *rewarded* for containing several different misspellings of the same query
-word — and because `coord` is per-document, no choice of boosts can cancel
-it. With the gentle `1/(dist+1)` decay this reward beat exact matching
-outright: searching `predisin` put a document holding `predsim` and `predsin`
-at rank 1, above the nine documents that actually contain `predisin`, which
-had been ranks 1–9 before fuzziness existed. The steep decay restores those
-nine to the top and appends the fuzzy hits below them. This corpus makes the
-failure easy to hit — `predsim` (123 messages), `predsin` and `predisin` (9)
-all coexist in it, and people write all three in the same conversation.
+**`fuzzyDistanceBoost` makes variants near-weightless (1.0 / 0.03 / 0.01),
+not `1/(editDistance+1)`.** Fuzzy matching is a fallback for when the spelling
+the user typed is absent from the index — not a competitor to the spelling
+that is there. Two things make a gentle decay actively wrong:
+
+- `coord` is `matchedTerms/clauseCount`, so a document is *rewarded* for
+  holding several different misspellings of the query word, and `coord` is
+  per-document so no boost can cancel it. At `1/(dist+1)`, searching
+  `predisin` put a document holding `predsim` and `predsin` at rank 1, above
+  the nine documents that actually contain `predisin`.
+- An edit-distance-1 neighbour is frequently a *different word*, not a typo —
+  `bolo`/`bola`, `aline`/`alien` — and nothing about the distance separates
+  the two cases. At `1/(dist+1)` a query for cake returned `bola` (ball) at
+  rank 2.
+
+**Recall does not depend on these weights, which is what makes the tuning
+one-sided.** When the query's spelling is absent from the index every
+candidate is fuzzy, so the shared weight cancels out of the ranking and the
+best true spelling lands at rank 1 regardless. Swept over 1/0.5/0.25 down to
+1/0.01/0.003, the recall probes (`predisim`, `anivrsario`, `alien`,
+`obrigadu`) returned rank 1 at *every* setting. The weights only govern how
+much fuzzy hits disturb exact ones, so low is strictly better; the guard
+metrics flatten out around 0.03/0.01 and gain nothing below it.
+
+At the chosen values every guard case matches its `fuzziness=0` baseline:
+`predisin` keeps ranks 1–9 exact and appends a fuzzy hit at 10 (it only has
+nine exact matches); `bolo` and `aniversario` are unchanged with `bola` first
+appearing at rank 17; `aline` is unchanged with `alien` reachable at 11 where
+it was previously unreachable; and querying the typo `alien` promotes `aline`
+from rank 2 to 1.
+
+**`FUZZY_BOOST` overrides the weights at runtime** (`FUZZY_BOOST=1,0.03,0.01`,
+read in `loadFuzzyBoostOverride` and called from `main.go` alongside the other
+init steps), because the right answer depends on how often a one-edit
+neighbour in a given corpus is a typo rather than a word of its own. Note
+that `systemctl --user set-environment` is enough to change it — no rebuild.
+Note also that scorch builds its Levenshtein automaton with
+`transposition=true`, so it is Damerau distance: `aline`→`alien` is one edit,
+not two.
 
 **Boosts cannot restore the lost magnitude; normalization does.** The obvious
 fix for the collapse — boosting every clause by the clause count so `coord`

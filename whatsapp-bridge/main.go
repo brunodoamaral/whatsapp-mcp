@@ -450,6 +450,9 @@ func main() {
 	audioPipeline.Start()
 	defer audioPipeline.Stop()
 
+	// Optional FUZZY_BOOST override for /api/search typo weighting.
+	loadFuzzyBoostOverride()
+
 	// Read-only SQL query endpoint for trusted local tooling.
 	if err := initQueryDB(); err != nil {
 		logger.Errorf("Failed to init read-only query database: %v", err)

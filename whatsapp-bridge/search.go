@@ -262,16 +262,61 @@ func fuzzyDictTerms(reader index.IndexReaderFuzzy, field, token string, dist int
 }
 
 // fuzzyDistanceBoost weights a variant by its edit distance from the query
-// term. The decay is far steeper than the obvious 1/(dist+1) because bleve's
-// disjunction scorer multiplies each document's summed score by
-// coord = matchedTerms/clauseCount — so a document is *rewarded* for holding
-// several different misspellings of the query word. With a gentle decay that
-// reward beats an exact match outright: searching "predisin" returned a
-// document holding "predsim" and "predsin" above the nine documents that
-// actually contain "predisin". coord is per-document, so no choice of boosts
-// can cancel it; a steep decay instead makes it impractical for a stack of
-// approximate matches to outvote the real spelling.
-var fuzzyDistanceBoost = [maxFuzziness + 1]float64{1.0, 0.12, 0.04}
+// term. Variants are deliberately near-weightless next to an exact match:
+// fuzzy matching is a fallback for when the spelling the user typed is not in
+// the index, not a competitor to the spelling that is.
+//
+// Two things make a gentle decay like 1/(dist+1) actively wrong here.
+//
+// First, bleve's disjunction scorer multiplies each document's summed score by
+// coord = matchedTerms/clauseCount, so a document is *rewarded* for holding
+// several different misspellings of the query word. coord is per-document, so
+// no choice of boosts can cancel it. At 1/(dist+1), searching "predisin"
+// returned a document holding "predsim" and "predsin" above the nine
+// documents that actually contain "predisin".
+//
+// Second, an edit-distance-1 neighbour is often a different word rather than
+// a typo — "bolo"/"bola", "aline"/"alien" — and nothing about the distance
+// distinguishes the two cases. Weighting distance-1 highly pulled "bola"
+// (a ball) to rank 2 for a query about cake.
+//
+// Measured against this corpus (see CLAUDE.md), recall is *unaffected* by
+// these weights: when the query's spelling is absent from the index every
+// candidate is fuzzy, so the shared factor cancels and the best true spelling
+// still lands at rank 1. The weights only govern how much fuzzy hits disturb
+// exact ones, so low is strictly better, and the guard metrics flatten out at
+// roughly these values.
+//
+// Overridable at runtime with FUZZY_BOOST, since the right answer depends on
+// how often a one-edit neighbour is a typo rather than a word of its own.
+var fuzzyDistanceBoost = [maxFuzziness + 1]float64{1.0, 0.03, 0.01}
+
+// loadFuzzyBoostOverride lets FUZZY_BOOST="1,0.12,0.04" retune the decay
+// without a rebuild. What the right weights are depends on the corpus — how
+// often a one-edit neighbour is a real typo rather than a different word — so
+// this is a dial worth having on a running bridge.
+func loadFuzzyBoostOverride() {
+	raw := os.Getenv("FUZZY_BOOST")
+	if raw == "" {
+		return
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) != len(fuzzyDistanceBoost) {
+		logger.Warnf("Ignoring FUZZY_BOOST=%q: want %d comma-separated weights", raw, len(fuzzyDistanceBoost))
+		return
+	}
+	var parsed [maxFuzziness + 1]float64
+	for i, part := range parts {
+		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil || v < 0 {
+			logger.Warnf("Ignoring FUZZY_BOOST=%q: bad weight %q", raw, part)
+			return
+		}
+		parsed[i] = v
+	}
+	fuzzyDistanceBoost = parsed
+	logger.Infof("Fuzzy distance boosts overridden: %v", fuzzyDistanceBoost)
+}
 
 // buildFuzzyTextQuery turns the expanded terms into one flat disjunction.
 //
