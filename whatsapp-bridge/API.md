@@ -83,6 +83,12 @@ first character of a term must always match. Fuzzy hits score
 `1/(editDistance+1)` of an exact hit, so exact matches still rank on top.
 Values above 2 are clamped.
 
+Scores are normalized so the best hit in a response is always `1.0` and the
+rest are relative to it. Raw BM25 scores are not comparable between queries,
+and fuzzy matching scales them by the size of the term expansion, so the
+absolute number never carried meaning — do not threshold on it across
+different queries.
+
 Note: messages within a search result use Go's default (capitalized, no `omitempty`) field names, unlike every other endpoint below — this differs from the `snake_case` used elsewhere in this API.
 
 Response:
@@ -95,7 +101,7 @@ Response:
     {
       "chat_jid": "5511999999999@s.whatsapp.net",
       "chat_name": "John",
-      "score": 0.95,
+      "score": 1.0,
       "messages": [
         {
           "Time": "2026-01-01T12:00:00Z",

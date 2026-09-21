@@ -176,16 +176,16 @@ job of relaying messages.
 ## `fuzziness` on `/api/search` (`search.go`, `handlers.go`)
 
 **The engine always supported this — it was simply never switched on.** The
-only text query the bridge builds is a single bleve `MatchQuery` on `context`;
-`SetFuzziness`/`SetPrefix` were never called, so bleve's default
-`Fuzziness = 0` applied and terms had to match the index exactly after
-analysis. Nothing about the index or the mapping had to change to enable
+bridge built one bleve `MatchQuery` on `context` and never called
+`SetFuzziness`/`SetPrefix`, so bleve's default `Fuzziness = 0` applied and
+terms had to match the index exactly after analysis. Nothing about the index or the mapping had to change to enable
 typo tolerance — it is purely query-time, so turning it on (or off again, or
 retuning it) never requires a reindex of `store/messages.bleve`.
 
-**Auto rather than a fixed edit distance.** `SetAutoFuzziness(true)` makes
-bleve pick the distance per term from the term's length
-(`searcher.GetAutoFuzziness`: >5 chars → 2, 3–5 → 1, ≤2 → 0). A single fixed
+**Auto rather than a fixed edit distance.** The distance is picked per term
+from the term's length via bleve's own `searcher.GetAutoFuzziness` (>5 chars →
+2, 3–5 → 1, ≤2 → 0) — called directly rather than reimplemented, so the
+thresholds cannot drift from bleve's. A single fixed
 distance is wrong at both ends of that range: distance 1 on a 3-letter stem
 matches most of the dictionary, while distance 1 on a long word misses the
 two-character slips people actually make. The `fuzziness` param still allows
@@ -193,21 +193,54 @@ two-character slips people actually make. The `fuzziness` param still allows
 because bleve's `MaxFuzziness` is 2 and a larger value is a hard query error
 (`fuzziness exceeds max (2)`), not a silently-degraded search.
 
-**No hand-built "exact OR fuzzy-with-lower-boost" disjunction.** The obvious
-worry is that a fuzzy match dilutes ranking against an exact one. It doesn't:
-bleve's `makeBatchSearchersBoosted` already scales each expanded term by
-`1/(editDistance+1)` — exact 1.0, distance-1 0.5, distance-2 0.33 — so exact
-matches keep outranking typo matches on their own. Building a two-clause
-boolean query on top of that would double the work for no ranking change.
+**Bleve's own MatchQuery fuzziness is not usable for scoring here, so the
+terms are expanded by hand.** `MatchQuery` with fuzziness rewrites each token
+into a `FuzzyQuery`, whose searcher is a disjunction over *every index term
+within edit distance*. The disjunction scorer then multiplies by
+`coord = matchedTerms/clauseCount`, and the term scorer multiplies again by
+`queryNorm = 1/sqrt(sum of squared clause weights)` — both of which grow with
+the size of the expansion. This corpus is WhatsApp messages and is therefore
+dense with misspellings, so expansions are huge *and wildly uneven*: measured
+on the live index, `aniversario` expands to ~8 terms at edit distance 1 while
+`bolo` expands to ~108 (and ~526 at distance 2). Since each token is divided
+by its *own* expansion size, a short token is silenced relative to a long one
+and multi-word ranking breaks — `q=aniversario bolo` started returning
+documents matching only `aniversario`, above documents matching both.
+
+`expandFuzzyTerms` therefore walks the dictionary itself via
+`FieldDictFuzzy` (`DictEntry` already carries `EditDistance` and `Count`, so
+no `FuzzyAutomaton` is needed) and `buildFuzzyTextQuery` puts every variant of
+every token into **one flat disjunction**. The denominator is then a single
+constant shared by all tokens, so the per-token distortion cancels and each
+variant is weighted only by its own `1/(editDistance+1)` boost. If the index
+reader does not implement `IndexReaderFuzzy`, or the walk fails, the code
+falls back to `MatchQuery` fuzziness and logs a warning — skewed scoring beats
+no search.
+
+**Boosts cannot restore the lost magnitude; normalization does.** The obvious
+fix for the collapse — boosting every clause by the clause count so `coord`
+cancels — does not work, and it is worth recording why so nobody tries it
+again: `TermQueryScorer.Weight()` is `(boost·idf)²` and `queryNorm` is
+`1/sqrt(Σ Weight)`, so scaling every boost by the same factor scales
+`queryNorm` down by exactly that factor. A uniform boost inside a disjunction
+always cancels itself out. Boost only ever expresses *relative* weight, which
+is why `1/(editDistance+1)` still does its job. Absolute magnitude is instead
+restored in `normalizeHitScores`, which divides through by the top score after
+the final sort: `coord` and `queryNorm` are constants for a given query, so
+they never affected ordering, only scale. This also makes the text-only path
+consistent with hybrid search, where bleve's RSF already min-max normalizes
+the text leg before fusing it.
 
 **`prefix_length = 1` is a cost guard, not a correctness one.** Fuzzy
 expansion walks the term FST; with no prefix constraint, every query term at
 distance 2 scans the whole term dictionary of a multi-hundred-MB index. This
 build also has bleve's `DisjunctionMaxClauseCount` at its default `0`
 (unlimited), so a pathological expansion degrades latency rather than
-erroring — the prefix is the only thing bounding it. The tradeoff is that a
-typo in the *first* character isn't caught; raise to 2 only if latency
-demands it, since that rejects noticeably more real typos.
+erroring. `maxFuzzyExpansion` is the second bound, capping each token's
+variant list and keeping the closest edits (then the most frequent) when it
+has to cut. The tradeoff of the prefix is that a typo in the *first*
+character isn't caught; raise it to 2 only if latency demands it, since that
+rejects noticeably more real typos.
 
 **Fuzziness applies to stemmed terms, which is why the analyzer matters
 here.** `pt_ascii` (`to_lower` → `ascii_folding_custom` → `stop_pt` →
@@ -219,12 +252,27 @@ measured on *stems*, not on what the user typed, so a stem of 6 characters
 gets distance 2. If recall ever turns out noisy in practice, `fuzziness=1` is
 the dial.
 
-**Side effect on `semantic_weight=1`.** At weight 1 the `MatchQuery` boost is
-zeroed but the query is still the base of the search request, so it acts as a
-hard filter on which docs the KNN leg can score at all. Fuzziness widens that
+**Side effect on `semantic_weight=1`.** At weight 1 the text leg's fusion
+weight is zeroed but the text query is still the base of the search request,
+so it acts as a hard filter on which docs the KNN leg can score at all.
+Fuzziness widens that
 filter, which makes "pure semantic" searches less term-dependent than they
 were — an improvement, but a real behavior change for callers that had tuned
 around the old narrowness.
+
+**`semantic_weight` has to be set on the top-level query, not the text
+query.** Bleve's RSF rescorer reads the text leg's fusion weight from
+`req.Query.Boost()` (`rescorer.go`: `origBoosts[0] = bQuery.Boost()`) and
+forces the live boost to 1.0 for the search itself. The original code set
+`SetBoost(1 - semanticWeight)` on the inner `MatchQuery`, which is the
+top-level query *only* when no filter is applied — pass `chat_jid` or
+`days_since` and the top level becomes a `BooleanQuery` whose boost defaults
+to 1.0 (a nil `*Boost` reads as 1.0), silently pinning the text weight to 1.0
+and taking `semantic_weight` out of the loop for every filtered hybrid
+search. The boost is now applied to whatever `searchQuery` ends up being,
+immediately before the request is built. This is safe because `BooleanQuery`
+and `DisjunctionQuery` both ignore their own `BoostVal` when constructing
+searchers — on a container query the boost is fusion weight and nothing else.
 
 ## Not done, on purpose
 

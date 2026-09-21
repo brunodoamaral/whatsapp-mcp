@@ -15,6 +15,8 @@ import (
 	"github.com/blevesearch/bleve/v2/mapping"
 	"github.com/blevesearch/bleve/v2/registry"
 	"github.com/blevesearch/bleve/v2/search/query"
+	"github.com/blevesearch/bleve/v2/search/searcher"
+	index "github.com/blevesearch/bleve_index_api"
 	"github.com/schollz/progressbar/v3"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
@@ -117,10 +119,9 @@ func init() {
 
 const contextNumMessages = 16 // messages per indexed context group
 
-// fuzzinessAuto lets bleve pick the edit distance per term from the term's
-// length (>5 chars -> 2, 3-5 -> 1, <=2 -> 0; see searcher.GetAutoFuzziness).
-// Bleve scores each fuzzy term by 1/(editDistance+1), so exact matches still
-// outrank typo matches without building a separate exact clause.
+// fuzzinessAuto picks the edit distance per term from the term's length
+// (>5 chars -> 2, 3-5 -> 1, <=2 -> 0), delegating to searcher.GetAutoFuzziness
+// so the thresholds stay in step with bleve's own.
 const fuzzinessAuto = -1
 
 // maxFuzziness mirrors bleve's searcher.MaxFuzziness — anything above it is a
@@ -131,6 +132,156 @@ const maxFuzziness = 2
 // exactly. Fuzzy expansion walks the term FST, so an unbounded prefix means a
 // full dictionary scan per query term on a multi-hundred-MB index.
 const searchPrefixLength = 1
+
+// maxFuzzyExpansion caps how many index terms a single query token may expand
+// to. This corpus is WhatsApp messages and so is dense with misspellings: a
+// 3-letter stem at edit distance 2 pulls in five hundred terms, each of which
+// becomes its own term searcher.
+const maxFuzzyExpansion = 256
+
+// fuzzyTerm is one index term within edit distance of a query token.
+type fuzzyTerm struct {
+	term string
+	dist uint8
+	freq uint64
+}
+
+// analyzeQueryTokens runs queryStr through the same analyzer the field uses at
+// index time, so the resulting tokens are directly comparable to index terms.
+// Hand-tokenizing would skip to_lower/ascii_folding/stop_pt/stemmer_pt_light
+// and produce terms that are not in the dictionary at all.
+func analyzeQueryTokens(index bleve.Index, queryStr string) []string {
+	analyzer := index.Mapping().AnalyzerNamed(ptAsciiAnalyzerName)
+	if analyzer == nil {
+		return nil
+	}
+	tokens := analyzer.Analyze([]byte(queryStr))
+	terms := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		terms = append(terms, string(t.Term))
+	}
+	return terms
+}
+
+// expandFuzzyTerms resolves each query token to the index terms within edit
+// distance of it, returning one slice per token plus the total across tokens.
+//
+// This exists because bleve's own MatchQuery fuzziness cannot be used for
+// scoring here: it rewrites each token into a FuzzyQuery whose searcher is a
+// disjunction over the whole expansion, and the disjunction scorer multiplies
+// by coord = matchedTerms/expansionSize. The expansion size varies by two
+// orders of magnitude between tokens in this corpus ("aniversario" ~8 terms,
+// "bolo" ~108 at distance 1), so tokens with large expansions get silently
+// zeroed out relative to tokens with small ones. Expanding here lets the
+// caller put every variant in a single flat disjunction with one shared
+// denominator, which cancels.
+func expandFuzzyTerms(idx bleve.Index, field string, tokens []string, fuzziness int) ([][]fuzzyTerm, int, error) {
+	adv, err := idx.Advanced()
+	if err != nil {
+		return nil, 0, fmt.Errorf("advanced index unavailable: %w", err)
+	}
+	reader, err := adv.Reader()
+	if err != nil {
+		return nil, 0, fmt.Errorf("index reader unavailable: %w", err)
+	}
+	defer reader.Close()
+
+	fuzzyReader, ok := reader.(index.IndexReaderFuzzy)
+	if !ok {
+		return nil, 0, fmt.Errorf("index reader does not support fuzzy dictionaries")
+	}
+
+	expanded := make([][]fuzzyTerm, 0, len(tokens))
+	total := 0
+	for _, token := range tokens {
+		dist := fuzziness
+		if dist == fuzzinessAuto {
+			dist = searcher.GetAutoFuzziness(token)
+		}
+		if dist <= 0 {
+			// Too short to be worth an edit; the token itself is the only variant.
+			expanded = append(expanded, []fuzzyTerm{{term: token}})
+			total++
+			continue
+		}
+
+		// FieldDictFuzzy takes a literal prefix, not a length. Tokens are
+		// ascii-folded by the analyzer, so slicing bytes is safe here.
+		prefix := token
+		if len(prefix) > searchPrefixLength {
+			prefix = prefix[:searchPrefixLength]
+		}
+		variants, err := fuzzyDictTerms(fuzzyReader, field, token, dist, prefix)
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(variants) == 0 {
+			// Not in the index at all — keep it as an exact term so the result
+			// matches what fuzziness=0 would have returned (no hits).
+			variants = []fuzzyTerm{{term: token}}
+		}
+		expanded = append(expanded, variants)
+		total += len(variants)
+	}
+	return expanded, total, nil
+}
+
+// fuzzyDictTerms walks the fuzzy field dictionary for one token, keeping at
+// most maxFuzzyExpansion terms, closest first.
+func fuzzyDictTerms(reader index.IndexReaderFuzzy, field, token string, dist int, prefix string) ([]fuzzyTerm, error) {
+	dict, err := reader.FieldDictFuzzy(field, token, dist, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("fuzzy dictionary for %q: %w", token, err)
+	}
+	defer dict.Close()
+
+	var variants []fuzzyTerm
+	for {
+		entry, err := dict.Next()
+		if err != nil {
+			return nil, fmt.Errorf("reading fuzzy dictionary for %q: %w", token, err)
+		}
+		if entry == nil {
+			break
+		}
+		variants = append(variants, fuzzyTerm{term: entry.Term, dist: entry.EditDistance, freq: entry.Count})
+	}
+
+	if len(variants) > maxFuzzyExpansion {
+		// Closest edits first, then the ones actually seen in the corpus, so
+		// the cap drops the noise rather than the real spellings.
+		sort.Slice(variants, func(i, j int) bool {
+			if variants[i].dist != variants[j].dist {
+				return variants[i].dist < variants[j].dist
+			}
+			return variants[i].freq > variants[j].freq
+		})
+		variants = variants[:maxFuzzyExpansion]
+	}
+	return variants, nil
+}
+
+// buildFuzzyTextQuery turns the expanded terms into one flat disjunction.
+//
+// Every variant is boosted by total/(dist+1). The disjunction scorer then
+// multiplies the summed score by coord = matchedTerms/total, so total cancels
+// and a document scores sum(bm25(term)/(dist+1)) over the variants it matched
+// — its natural BM25 score for an exact hit, halved at edit distance 1, and so
+// on. Without the total factor every score would be divided by the expansion
+// size, which is what made scores collapse (1.31 -> 0.09 for "aniversario").
+func buildFuzzyTextQuery(expanded [][]fuzzyTerm, total int, field string) query.Query {
+	disjunction := bleve.NewDisjunctionQuery()
+	disjunction.SetMin(1)
+	for _, variants := range expanded {
+		for _, v := range variants {
+			tq := bleve.NewTermQuery(v.term)
+			tq.SetField(field)
+			tq.SetBoost(float64(total) / float64(v.dist+1))
+			disjunction.AddQuery(tq)
+		}
+	}
+	return disjunction
+}
 
 // debugLogContext logs a context group at DEBUG level (no-op when logger is above DEBUG).
 func debugLogContext(chatJID string, group int, ctxStr string) {
@@ -680,6 +831,67 @@ func reIndexAllMessages(store *MessageStore, maxRows int, chatFilter string) err
 	return nil
 }
 
+// buildTextQuery builds the text side of the search.
+//
+// With fuzziness off this is bleve's plain MatchQuery. With it on we expand
+// the terms ourselves and build a flat disjunction (see expandFuzzyTerms for
+// why bleve's own MatchQuery fuzziness cannot be used for scoring). If
+// anything about the expansion fails we fall back to MatchQuery fuzziness —
+// its scoring is skewed, but a skewed search beats no search.
+func buildTextQuery(idx bleve.Index, queryStr string, fuzziness int) query.Query {
+	matchQuery := bleve.NewMatchQuery(queryStr)
+	matchQuery.SetField("context")
+
+	if fuzziness == 0 {
+		return matchQuery
+	}
+
+	if tokens := analyzeQueryTokens(idx, queryStr); len(tokens) > 0 {
+		expanded, total, err := expandFuzzyTerms(idx, "context", tokens, fuzziness)
+		if err == nil && total > 0 {
+			logger.Debugf("Fuzzy expansion: %d token(s) -> %d index terms", len(tokens), total)
+			return buildFuzzyTextQuery(expanded, total, "context")
+		}
+		if err != nil {
+			logger.Warnf("Fuzzy term expansion failed, falling back to match-query fuzziness: %v", err)
+		}
+	}
+
+	if fuzziness == fuzzinessAuto {
+		matchQuery.SetAutoFuzziness(true)
+	} else {
+		matchQuery.SetFuzziness(fuzziness)
+	}
+	matchQuery.SetPrefix(searchPrefixLength)
+	return matchQuery
+}
+
+// normalizeHitScores rescales scores so the best hit is 1.0.
+//
+// Raw bleve scores are not comparable across queries, and with fuzzy matching
+// they are not even comparable across fuzziness settings: a disjunction
+// divides every score by coord (matchedTerms/clauseCount) and again by
+// queryNorm (1/sqrt of the summed squared clause weights), both of which grow
+// with the size of the term expansion. Boosting the clauses cannot undo this —
+// queryNorm is computed from the boosts, so a uniform boost cancels itself
+// out. Since both factors are constants for a given query, they leave the
+// ordering intact and only distort the magnitude, which is exactly what
+// dividing through by the maximum removes.
+//
+// This also makes the text-only path consistent with hybrid search, where
+// bleve's RSF already min-max normalizes the text leg before fusing it.
+//
+// hits must already be sorted descending.
+func normalizeHitScores(hits []rescoredHit) {
+	if len(hits) == 0 || hits[0].score <= 0 {
+		return
+	}
+	max := hits[0].score
+	for i := range hits {
+		hits[i].score /= max
+	}
+}
+
 // rescoredHit holds a bleve hit after rescoring, with parsed fields.
 type rescoredHit struct {
 	chatJID string
@@ -693,24 +905,9 @@ type rescoredHit struct {
 func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int, fuzziness int) ([]SearchResult, error) {
 	logger.Debugf("Searching for \"%s\" (chatJID=%v, limit=%d, fuzziness=%d)", queryStr, chatJIDs, limit, fuzziness)
 
-	// Main query — target the context field so bleve uses pt_ascii to analyze
-	// the query, matching the analyzer used at index time.
-	matchQuery := bleve.NewMatchQuery(queryStr)
-	matchQuery.SetField("context")
-	matchQuery.SetBoost(1.0 - semanticWeight)
-
-	// Typo tolerance. Note this matches against *analyzed* terms, i.e. already
-	// lowercased, accent-folded and pt-light-stemmed — so accent and inflection
-	// variants are handled by the analyzer and the edit distance only has to
-	// absorb actual misspellings. fuzziness == 0 keeps exact term matching.
-	switch {
-	case fuzziness == fuzzinessAuto:
-		matchQuery.SetAutoFuzziness(true)
-		matchQuery.SetPrefix(searchPrefixLength)
-	case fuzziness > 0:
-		matchQuery.SetFuzziness(fuzziness)
-		matchQuery.SetPrefix(searchPrefixLength)
-	}
+	// Main query — target the context field so the same pt_ascii analysis is
+	// applied to the query as at index time.
+	textQuery := buildTextQuery(store.index, queryStr, fuzziness)
 
 	// Build text query.
 	var searchQuery query.Query
@@ -726,7 +923,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 		}
 		booleanQuery.AddMust(jidDisjunction)
 		// Text query
-		booleanQuery.AddMust(matchQuery)
+		booleanQuery.AddMust(textQuery)
 		searchQuery = booleanQuery
 		expandFactor := len(chatJIDs)
 		if expandFactor > 5 {
@@ -734,7 +931,7 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 		}
 		fetchSize = limit * expandFactor
 	} else {
-		searchQuery = matchQuery
+		searchQuery = textQuery
 		fetchSize = limit * 5 // Increase fecth size for open search to compensate for deduplication and filtering
 	}
 
@@ -748,6 +945,17 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 		booleanQuery.AddMust(searchQuery)
 		booleanQuery.AddMust(dateQuery)
 		searchQuery = booleanQuery
+	}
+
+	// The semantic/text balance has to be set on whatever ends up as the
+	// top-level query: bleve's RSF rescorer reads its fusion weight from
+	// req.Query.Boost() and neutralizes the live boost during the search. Set
+	// on an inner query it would be ignored whenever chat_jid or days_since
+	// wraps it in a BooleanQuery, silently pinning the text weight to 1.0.
+	// Container queries ignore their own boost when scoring, so this only ever
+	// acts as the fusion weight.
+	if boostable, ok := searchQuery.(query.BoostableQuery); ok {
+		boostable.SetBoost(1.0 - semanticWeight)
 	}
 
 	// Over-fetch to compensate for deduplication.
@@ -857,6 +1065,8 @@ func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, lim
 		}
 		return hits[i].score > hits[j].score
 	})
+
+	normalizeHitScores(hits)
 
 	// Build SearchResults: one per hit, fetching group messages directly from SQLite.
 	var results []SearchResult
