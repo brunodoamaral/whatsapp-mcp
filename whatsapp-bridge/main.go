@@ -95,6 +95,7 @@ func main() {
 	backfill := flag.Bool("transcribe-backfill", false, "transcribe all voice notes whose media is already on disk, then exit")
 	backfillDays := flag.Int("transcribe-since-days", 0, "limit --transcribe-backfill to messages from the last N days (0 = all)")
 	skipIndex := flag.Bool("skip-index", false, "with --transcribe-backfill: write transcripts to SQLite only, leaving the bleve index untouched so the bridge can keep running (requires a later --reindex all)")
+	pairPhone := flag.String("pair-phone", "", "when logging in, request an 8-digit pairing code for this phone number (international format, digits only, e.g. 15551234567) instead of showing a QR code")
 	flag.Parse()
 
 	if *backfill {
@@ -383,15 +384,32 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				logger.Infof("Scan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		go func() {
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					if *pairPhone == "" {
+						logger.Infof("Scan this QR code with your WhatsApp app:")
+						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					}
+				} else if evt.Event == "success" {
+					connected <- true
+					return
+				}
 			}
+		}()
+
+		if *pairPhone != "" {
+			// PairPhone requires the login websocket to be up first; the qrChan
+			// goroutine above already triggered Connect(), so a short sleep is
+			// whatsmeow's documented fallback to GetQRChannel's first event for
+			// making sure that's established (see pair-code.go's PairPhone doc).
+			time.Sleep(1 * time.Second)
+			code, err := client.PairPhone(context.Background(), *pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if err != nil {
+				logger.Errorf("Failed to request pairing code: %v", err)
+				return
+			}
+			logger.Infof("Enter this pairing code in WhatsApp (Settings > Linked Devices > Link a Device > Link with phone number instead): %s", code)
 		}
 
 		// Wait for connection
