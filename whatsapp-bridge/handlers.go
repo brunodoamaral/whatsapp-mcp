@@ -149,6 +149,7 @@ func makeSearchHandler(messageStore *MessageStore) http.HandlerFunc {
 		limitStr := r.URL.Query().Get("limit")
 		semanticWeightStr := r.URL.Query().Get("semantic_weight")
 		daysSinceStr := r.URL.Query().Get("days_since")
+		fuzzinessStr := r.URL.Query().Get("fuzziness")
 
 		daysSince := 0 // default to no time filter
 		if daysSinceStr != "" {
@@ -184,17 +185,35 @@ func makeSearchHandler(messageStore *MessageStore) http.HandlerFunc {
 			semanticWeight = 0.0
 		}
 
-		results, err := messageStore.SearchMessages(query, chatJIDs, limit, semanticWeight, daysSince)
+		// Typo tolerance: auto (bleve picks the edit distance per term from its
+		// length) unless the caller asks for a fixed distance or turns it off
+		// with 0. Above maxFuzziness bleve errors outright, so clamp instead.
+		fuzziness := fuzzinessAuto
+		if fuzzinessStr != "" && fuzzinessStr != "auto" {
+			if f, err := strconv.Atoi(fuzzinessStr); err == nil && f >= 0 {
+				if f > maxFuzziness {
+					f = maxFuzziness
+				}
+				fuzziness = f
+			}
+		}
+
+		results, err := messageStore.SearchMessages(query, chatJIDs, limit, semanticWeight, daysSince, fuzziness)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Search failed: %v", err), http.StatusInternalServerError)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		fuzzinessOut := interface{}("auto")
+		if fuzziness != fuzzinessAuto {
+			fuzzinessOut = fuzziness
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"query":   query,
-			"results": results,
-			"total":   len(results),
+			"query":     query,
+			"fuzziness": fuzzinessOut,
+			"results":   results,
+			"total":     len(results),
 		})
 	}
 }

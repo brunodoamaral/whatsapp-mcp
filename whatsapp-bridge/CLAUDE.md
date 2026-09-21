@@ -173,6 +173,59 @@ logging (not fataling) on failure — consistent with how the query DB's init
 failure is handled, since neither endpoint is required for the bridge's core
 job of relaying messages.
 
+## `fuzziness` on `/api/search` (`search.go`, `handlers.go`)
+
+**The engine always supported this — it was simply never switched on.** The
+only text query the bridge builds is a single bleve `MatchQuery` on `context`;
+`SetFuzziness`/`SetPrefix` were never called, so bleve's default
+`Fuzziness = 0` applied and terms had to match the index exactly after
+analysis. Nothing about the index or the mapping had to change to enable
+typo tolerance — it is purely query-time, so turning it on (or off again, or
+retuning it) never requires a reindex of `store/messages.bleve`.
+
+**Auto rather than a fixed edit distance.** `SetAutoFuzziness(true)` makes
+bleve pick the distance per term from the term's length
+(`searcher.GetAutoFuzziness`: >5 chars → 2, 3–5 → 1, ≤2 → 0). A single fixed
+distance is wrong at both ends of that range: distance 1 on a 3-letter stem
+matches most of the dictionary, while distance 1 on a long word misses the
+two-character slips people actually make. The `fuzziness` param still allows
+`0`/`1`/`2` for callers that want to pin it; anything higher is clamped,
+because bleve's `MaxFuzziness` is 2 and a larger value is a hard query error
+(`fuzziness exceeds max (2)`), not a silently-degraded search.
+
+**No hand-built "exact OR fuzzy-with-lower-boost" disjunction.** The obvious
+worry is that a fuzzy match dilutes ranking against an exact one. It doesn't:
+bleve's `makeBatchSearchersBoosted` already scales each expanded term by
+`1/(editDistance+1)` — exact 1.0, distance-1 0.5, distance-2 0.33 — so exact
+matches keep outranking typo matches on their own. Building a two-clause
+boolean query on top of that would double the work for no ranking change.
+
+**`prefix_length = 1` is a cost guard, not a correctness one.** Fuzzy
+expansion walks the term FST; with no prefix constraint, every query term at
+distance 2 scans the whole term dictionary of a multi-hundred-MB index. This
+build also has bleve's `DisjunctionMaxClauseCount` at its default `0`
+(unlimited), so a pathological expansion degrades latency rather than
+erroring — the prefix is the only thing bounding it. The tradeoff is that a
+typo in the *first* character isn't caught; raise to 2 only if latency
+demands it, since that rejects noticeably more real typos.
+
+**Fuzziness applies to stemmed terms, which is why the analyzer matters
+here.** `pt_ascii` (`to_lower` → `ascii_folding_custom` → `stop_pt` →
+`stemmer_pt_light`) runs on both the index and the query side, so accent
+variants (`remedio`/`remédio`) and inflections (`comprimido`/`comprimidos`)
+already matched before this change — the edit distance only has to absorb
+genuine misspellings. The flip side is that auto's length thresholds are
+measured on *stems*, not on what the user typed, so a stem of 6 characters
+gets distance 2. If recall ever turns out noisy in practice, `fuzziness=1` is
+the dial.
+
+**Side effect on `semantic_weight=1`.** At weight 1 the `MatchQuery` boost is
+zeroed but the query is still the base of the search request, so it acts as a
+hard filter on which docs the KNN leg can score at all. Fuzziness widens that
+filter, which makes "pure semantic" searches less term-dependent than they
+were — an improvement, but a real behavior change for callers that had tuned
+around the old narrowness.
+
 ## Not done, on purpose
 
 Row-level or query-level auth/audit beyond "not intended to be reachable

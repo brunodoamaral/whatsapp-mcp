@@ -117,6 +117,21 @@ func init() {
 
 const contextNumMessages = 16 // messages per indexed context group
 
+// fuzzinessAuto lets bleve pick the edit distance per term from the term's
+// length (>5 chars -> 2, 3-5 -> 1, <=2 -> 0; see searcher.GetAutoFuzziness).
+// Bleve scores each fuzzy term by 1/(editDistance+1), so exact matches still
+// outrank typo matches without building a separate exact clause.
+const fuzzinessAuto = -1
+
+// maxFuzziness mirrors bleve's searcher.MaxFuzziness — anything above it is a
+// hard query error ("fuzziness exceeds max (2)"), so callers get clamped.
+const maxFuzziness = 2
+
+// searchPrefixLength requires the first character of each term to match
+// exactly. Fuzzy expansion walks the term FST, so an unbounded prefix means a
+// full dictionary scan per query term on a multi-hundred-MB index.
+const searchPrefixLength = 1
+
 // debugLogContext logs a context group at DEBUG level (no-op when logger is above DEBUG).
 func debugLogContext(chatJID string, group int, ctxStr string) {
 	logger.Debugf("--- %s group %d ---\n%s", chatJID, group, ctxStr)
@@ -675,14 +690,27 @@ type rescoredHit struct {
 // searchMessages performs a hybrid text + vector search using bleve's score
 // fusion, then applies custom rescoring (mute penalty, user-ratio boost) and
 // returns one SearchResult per matched context group.
-func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int) ([]SearchResult, error) {
-	logger.Debugf("Searching for \"%s\" (chatJID=%v, limit=%d, offset=%d)", queryStr, chatJIDs, limit)
+func searchMessages(store *MessageStore, queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int, fuzziness int) ([]SearchResult, error) {
+	logger.Debugf("Searching for \"%s\" (chatJID=%v, limit=%d, fuzziness=%d)", queryStr, chatJIDs, limit, fuzziness)
 
 	// Main query — target the context field so bleve uses pt_ascii to analyze
 	// the query, matching the analyzer used at index time.
 	matchQuery := bleve.NewMatchQuery(queryStr)
 	matchQuery.SetField("context")
 	matchQuery.SetBoost(1.0 - semanticWeight)
+
+	// Typo tolerance. Note this matches against *analyzed* terms, i.e. already
+	// lowercased, accent-folded and pt-light-stemmed — so accent and inflection
+	// variants are handled by the analyzer and the edit distance only has to
+	// absorb actual misspellings. fuzziness == 0 keeps exact term matching.
+	switch {
+	case fuzziness == fuzzinessAuto:
+		matchQuery.SetAutoFuzziness(true)
+		matchQuery.SetPrefix(searchPrefixLength)
+	case fuzziness > 0:
+		matchQuery.SetFuzziness(fuzziness)
+		matchQuery.SetPrefix(searchPrefixLength)
+	}
 
 	// Build text query.
 	var searchQuery query.Query

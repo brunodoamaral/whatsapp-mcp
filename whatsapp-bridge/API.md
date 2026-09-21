@@ -60,7 +60,7 @@ Files are saved under `store/{chat_jid_colons_replaced}/` and cached (re-downloa
 ## Search messages
 
 ```
-GET /api/search?q=hello&limit=10&days_since=30&chat_jid=...&semantic_weight=0.5
+GET /api/search?q=hello&limit=10&days_since=30&chat_jid=...&semantic_weight=0.5&fuzziness=auto
 ```
 
 | Param | Default | Description |
@@ -70,8 +70,18 @@ GET /api/search?q=hello&limit=10&days_since=30&chat_jid=...&semantic_weight=0.5
 | `days_since` | — | Restrict to last N days |
 | `chat_jid` | — | Comma-separated JIDs to filter |
 | `semantic_weight` | 0.5 | 0 = text only, 1 = semantic only |
+| `fuzziness` | `auto` | Typo tolerance: `auto` (edit distance per term by length), `0` (exact), `1`, `2` |
 
 Results are grouped into context windows of up to 16 consecutive messages.
+
+Fuzziness matches against *analyzed* terms — already lowercased, accent-folded
+and Portuguese-light-stemmed — so accent and inflection variants (`remedio` /
+`remédio`, `comprimido` / `comprimidos`) match at `fuzziness=0` already, and the
+edit distance only has to absorb real misspellings. `auto` means edit distance
+2 for terms longer than 5 characters, 1 for 3–5, and 0 for 2 or shorter. The
+first character of a term must always match. Fuzzy hits score
+`1/(editDistance+1)` of an exact hit, so exact matches still rank on top.
+Values above 2 are clamped.
 
 Note: messages within a search result use Go's default (capitalized, no `omitempty`) field names, unlike every other endpoint below — this differs from the `snake_case` used elsewhere in this API.
 
@@ -79,6 +89,7 @@ Response:
 ```json
 {
   "query": "hello",
+  "fuzziness": "auto",
   "total": 2,
   "results": [
     {

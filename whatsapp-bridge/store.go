@@ -550,8 +550,8 @@ func (store *MessageStore) GetMessagesSincePerJID(since map[string]time.Time) ([
 }
 
 // SearchMessages delegates to the search module.
-func (store *MessageStore) SearchMessages(queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int) ([]SearchResult, error) {
-	return searchMessages(store, queryStr, chatJIDs, limit, semanticWeight, daysSince)
+func (store *MessageStore) SearchMessages(queryStr string, chatJIDs []string, limit int, semanticWeight float64, daysSince int, fuzziness int) ([]SearchResult, error) {
+	return searchMessages(store, queryStr, chatJIDs, limit, semanticWeight, daysSince, fuzziness)
 }
 
 // Store additional media info in the database
