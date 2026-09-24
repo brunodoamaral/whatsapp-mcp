@@ -165,12 +165,22 @@ type subscriber struct {
 type MessageBroadcaster struct {
 	clients map[*subscriber]struct{}
 	mu      sync.RWMutex
+
+	// Voice notes awaiting transcription (see holdback.go).
+	holdMu   sync.Mutex
+	held     map[string]*heldBroadcast // holdKey -> held message
+	released []releasedBroadcast       // recent releases, oldest first
+	// refresh reloads a held message's content and transcript status from the
+	// database just before it is released.
+	refresh func(*BroadcastMessage)
 }
 
-// NewMessageBroadcaster creates an empty broadcaster.
-func NewMessageBroadcaster() *MessageBroadcaster {
+// NewMessageBroadcaster creates an empty broadcaster. refresh may be nil.
+func NewMessageBroadcaster(refresh func(*BroadcastMessage)) *MessageBroadcaster {
 	return &MessageBroadcaster{
 		clients: make(map[*subscriber]struct{}),
+		held:    make(map[string]*heldBroadcast),
+		refresh: refresh,
 	}
 }
 
@@ -251,7 +261,7 @@ func (b *MessageBroadcaster) Broadcast(msg BroadcastMessage) {
 	defer b.mu.RUnlock()
 
 	subscriberCount := len(b.clients)
-	logger.Infof("Broadcast: chat=%q jid=%s subscribers=%d", msg.ChatName, msg.ChatJID, subscriberCount)
+	logger.Infof("Broadcast: chat=%q jid=%s id=%s subscribers=%d", msg.ChatName, msg.ChatJID, msg.Message.ID, subscriberCount)
 
 	delivered := 0
 	dropped := 0
@@ -345,6 +355,10 @@ type ClientRegistry struct {
 	db    *sql.DB
 	mu    sync.Mutex
 	cache map[string]map[string]time.Time // client_name -> chat_jid -> last_seen
+	// disconnectedAt is in-memory only: it lets a reconnecting client be sent
+	// held voice notes that were released while it was away (see
+	// MessageBroadcaster.catchUpView). Lost on restart, as are the holds.
+	disconnectedAt map[string]time.Time
 }
 
 // NewClientRegistry migrates the client_last_seen table to its per-JID
@@ -385,7 +399,7 @@ func NewClientRegistry(db *sql.DB) (*ClientRegistry, error) {
 		cache[name][jid] = t
 	}
 
-	return &ClientRegistry{db: db, cache: cache}, nil
+	return &ClientRegistry{db: db, cache: cache, disconnectedAt: make(map[string]time.Time)}, nil
 }
 
 // migrateClientLastSeenTable upgrades a pre-existing client_last_seen table
@@ -475,4 +489,19 @@ func (r *ClientRegistry) UpdateLastSeen(name, jid string, t time.Time) error {
 		WHERE excluded.last_seen > client_last_seen.last_seen`,
 		name, jid, t)
 	return err
+}
+
+// MarkDisconnected records that clientName's connection just ended.
+func (r *ClientRegistry) MarkDisconnected(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.disconnectedAt[name] = time.Now()
+}
+
+// LastDisconnected returns when clientName last disconnected during this
+// process's lifetime, or the zero time if it hasn't.
+func (r *ClientRegistry) LastDisconnected(name string) time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.disconnectedAt[name]
 }

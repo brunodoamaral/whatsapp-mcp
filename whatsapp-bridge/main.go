@@ -67,7 +67,8 @@ var logger waLog.Logger
 var traceEnabled bool
 
 // audioPipeline downloads and transcribes voice notes in the background.
-// nil until Start() runs; its methods tolerate a nil receiver.
+// Created before the event handler is attached; its methods tolerate a nil
+// receiver.
 var audioPipeline *AudioPipeline
 
 // tracef logs only when LOG_LEVEL=TRACE
@@ -246,7 +247,19 @@ func main() {
 		}
 	}()
 
-	broadcaster := NewMessageBroadcaster()
+	broadcaster := NewMessageBroadcaster(refreshFromStore(messageStore))
+
+	// The voice-note pipeline exists before any message can arrive, so the
+	// offline backlog delivered on connect is held for its transcript like
+	// any live voice note. Its workers start once connected (see below).
+	audioPipeline = NewAudioPipeline(client, messageStore)
+	audioPipeline.Prepare()
+	audioPipeline.onSettled = func(id, chatJID, status string) {
+		broadcaster.Release(chatJID, id, status)
+	}
+	if audioPipeline.cfg.enabled {
+		rehold(broadcaster, messageStore)
+	}
 
 	registry, err := NewClientRegistry(messageStore.db)
 	if err != nil {
@@ -261,7 +274,7 @@ func main() {
 			lastMessageAt.Store(time.Now().UnixNano())
 			// Process regular messages and broadcast to WebSocket subscribers
 			if bm := handleMessage(client, messageStore, v, logger); bm != nil {
-				broadcaster.Broadcast(*bm)
+				dispatchMessage(broadcaster, *bm)
 			}
 
 		case *events.Contact:
@@ -446,7 +459,6 @@ func main() {
 	go runMessageWatchdog()
 
 	// Start voice-note download/transcription pipeline.
-	audioPipeline = NewAudioPipeline(client, messageStore)
 	audioPipeline.Start()
 	defer audioPipeline.Stop()
 

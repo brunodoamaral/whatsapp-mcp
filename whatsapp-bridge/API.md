@@ -362,9 +362,45 @@ Connect with any WebSocket client. Each incoming WhatsApp message is pushed imme
 }
 ```
 
+A voice note, pushed once its transcript is ready:
+
+```json
+{
+  "chat_jid": "5511999999999@s.whatsapp.net",
+  "chat_name": "John",
+  "message": {
+    "id": "3A2C376F2F3BA43AB331",
+    "time": "2026-09-24T18:18:56-03:00",
+    "sender": "5511999999999",
+    "full_name": "John",
+    "content": "Oi, passa lá em casa amanhã às dez",
+    "is_from_me": false,
+    "media_type": "audio",
+    "filename": "audio_20260924_181856.ogg",
+    "transcript_status": "done"
+  }
+}
+```
+
 `media_type`, `filename`, and `reply_to_id` are omitted when empty.
 
-**Catch-up:** On connect, the server replays all messages missed since this client's last disconnect (tracked by `client_name`). If `jids` is set, only messages matching those JIDs are replayed. This ensures clients never miss messages across restarts.
+**Voice notes are delayed until transcribed.** An uncaptioned voice note (`media_type: "audio"`) is not pushed when it arrives. The bridge holds it until its transcription finishes, then pushes it **once**, with the transcript already in `content`. It does not send an empty message first and fill it in later. The hold lasts at most **4 minutes**. After that the message is pushed with whatever it has, and a transcript that finishes later does not trigger a second push (it is still written to the database and search index). Everything else is pushed immediately, as are all messages when transcription is disabled. This applies to your own outbound voice notes (`is_from_me: true`, sent from another device) too.
+
+Voice notes also carry `transcript_status`, so a client can tell "transcribed" from "no text available" without guessing from an empty `content`:
+
+| `transcript_status` | Meaning | `content` |
+|---|---|---|
+| `done` | Transcribed | the transcript |
+| `empty` | Transcribed, but nothing usable (silence, noise) | empty |
+| `no_media` | Audio could not be downloaded (expired on WhatsApp's servers) | empty |
+| `failed` | ffmpeg/whisper error (retried later; no second push) | empty |
+| `pending` / `downloaded` / `retrying` | Still in progress: the 4-minute cap was hit, or transcription is disabled | empty |
+
+The field is omitted for all other messages, and for voice notes that arrived with a caption. Catch-up replays include it too.
+
+*Why:* consumers that react to each incoming message used to analyze the empty audio. They then never saw the transcript, because filling `content` in afterwards sent no event and did not change the message ID.
+
+**Catch-up:** On connect, the server replays all messages missed since this client's last disconnect (tracked by `client_name`). If `jids` is set, only messages matching those JIDs are replayed. This ensures clients never miss messages across restarts. A voice note that is still held is left out of the replay and arrives live once it's released. A voice note released while the client was disconnected is added to the replay, even if later messages have already moved the client's cursor past it. If the bridge restarts while holding voice notes, it re-holds any less than 4 minutes old for the rest of their cap. Older ones are never pushed live and reach clients only through catch-up.
 
 **Typing events (`typing=true`):** When enabled, a `typing` payload is pushed whenever someone starts or stops typing in a chat the connection is subscribed to (or any chat, if `jids` is omitted):
 

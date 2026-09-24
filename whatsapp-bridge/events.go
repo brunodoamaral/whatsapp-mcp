@@ -88,11 +88,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return nil
 	}
 
-	// Voice notes go straight into the download queue: WhatsApp media URLs
-	// expire, so the audio has to reach local disk well before transcription
-	// gets around to it.
+	// An uncaptioned voice note carries its pipeline state in the broadcast,
+	// read back rather than assumed: a redelivered message may already have
+	// been transcribed, in which case it goes out with the transcript.
+	var transcriptStatus string
 	if mediaType == "audio" && content == "" {
-		audioPipeline.Enqueue(msg.Info.ID, chatJID, msg.Info.Timestamp)
+		if err := messageStore.db.QueryRow(
+			`SELECT COALESCE(content, ''), COALESCE(transcript_status, '') FROM messages WHERE id = ? AND chat_jid = ?`,
+			msg.Info.ID, chatJID,
+		).Scan(&content, &transcriptStatus); err != nil {
+			logger.Warnf("Failed to read transcript state for %s: %v", msg.Info.ID, err)
+		}
 	}
 
 	// Log message reception
@@ -122,6 +128,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			MediaType: mediaType,
 			Filename:  filename,
 			ReplyToID: replyToID,
+
+			TranscriptStatus: transcriptStatus,
 		},
 	}
 }

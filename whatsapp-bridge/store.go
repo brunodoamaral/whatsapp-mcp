@@ -437,7 +437,7 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 			query := fmt.Sprintf(`
 				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
 					m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
-					m.is_from_me, m.media_type, m.filename, m.reply_to_id
+					m.is_from_me, m.media_type, m.filename, m.reply_to_id, COALESCE(m.transcript_status, '')
 				FROM messages m
 				LEFT JOIN chats c ON c.jid = m.chat_jid
 				WHERE m.chat_jid IN (%s) AND m.timestamp > ?
@@ -447,7 +447,7 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 			return store.db.Query(`
 				SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
 					m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
-					m.is_from_me, m.media_type, m.filename, m.reply_to_id
+					m.is_from_me, m.media_type, m.filename, m.reply_to_id, COALESCE(m.transcript_status, '')
 				FROM messages m
 				LEFT JOIN chats c ON c.jid = m.chat_jid
 				WHERE m.timestamp > ?
@@ -470,7 +470,7 @@ func (store *MessageStore) GetAllMessagesSince(since time.Time, chatJIDs []strin
 		err := rows.Scan(
 			&msg.ID, &bm.ChatJID, &bm.ChatName,
 			&msg.Sender, &msg.FullName, &msg.Content, &ts,
-			&msg.IsFromMe, &mediaType, &filename, &replyToID,
+			&msg.IsFromMe, &mediaType, &filename, &replyToID, &msg.TranscriptStatus,
 		)
 		if err != nil {
 			return nil, err
@@ -503,7 +503,7 @@ func (store *MessageStore) GetMessagesSincePerJID(since map[string]time.Time) ([
 		rows, err := store.db.Query(`
 			SELECT m.id, m.chat_jid, COALESCE(c.name, m.chat_jid),
 				m.sender, COALESCE(m.full_name, ''), COALESCE(m.content, ''), m.timestamp,
-				m.is_from_me, m.media_type, m.filename, m.reply_to_id
+				m.is_from_me, m.media_type, m.filename, m.reply_to_id, COALESCE(m.transcript_status, '')
 			FROM messages m
 			LEFT JOIN chats c ON c.jid = m.chat_jid
 			WHERE m.chat_jid = ? AND m.timestamp > ?
@@ -521,7 +521,7 @@ func (store *MessageStore) GetMessagesSincePerJID(since map[string]time.Time) ([
 			err := rows.Scan(
 				&msg.ID, &bm.ChatJID, &bm.ChatName,
 				&msg.Sender, &msg.FullName, &msg.Content, &ts,
-				&msg.IsFromMe, &mediaType, &filename, &replyToID,
+				&msg.IsFromMe, &mediaType, &filename, &replyToID, &msg.TranscriptStatus,
 			)
 			if err != nil {
 				rows.Close()

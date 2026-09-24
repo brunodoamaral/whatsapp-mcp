@@ -124,6 +124,11 @@ type AudioPipeline struct {
 
 	retryMu      sync.Mutex
 	pendingRetry map[string]*mediaRetryState // messageID -> state, awaiting a MediaRetry event
+
+	// onSettled is called when a voice note reaches a terminal state for the
+	// purpose of broadcasting (done, empty, no_media, failed), to release its
+	// held broadcast. nil when nothing is listening (backfill).
+	onSettled func(id, chatJID, status string)
 }
 
 // mediaRetryState carries what's needed to finish a download once the
@@ -150,9 +155,11 @@ func NewAudioPipeline(client *whatsmeow.Client, store *MessageStore) *AudioPipel
 	}
 }
 
-// Start launches the workers and the periodic sweeper. Safe to call when
-// transcription is disabled or misconfigured — it logs and does nothing.
-func (p *AudioPipeline) Start() {
+// Prepare checks that transcription can actually run and disables it (with
+// a log line) if not. It runs before the WhatsApp event handler is attached,
+// so that whether a voice note's broadcast is held (awaitsTranscript) is
+// already settled for the offline backlog delivered right after connect.
+func (p *AudioPipeline) Prepare() {
 	if !p.cfg.enabled {
 		logger.Infof("Voice-note transcription disabled (TRANSCRIBE_DISABLED set)")
 		return
@@ -175,7 +182,15 @@ func (p *AudioPipeline) Start() {
 
 	logger.Infof("Voice-note transcription enabled (model=%s lang=%s threads=%d)",
 		filepath.Base(p.cfg.model), p.cfg.lang, p.cfg.threads)
+}
 
+// Start launches the workers and the periodic sweeper. Jobs enqueued between
+// Prepare and Start wait in the channel buffers. A no-op when Prepare
+// disabled transcription.
+func (p *AudioPipeline) Start() {
+	if !p.cfg.enabled {
+		return
+	}
 	for i := 0; i < 2; i++ {
 		p.wg.Add(1)
 		go p.downloadWorker()
@@ -213,6 +228,28 @@ func (p *AudioPipeline) setStatus(id, chatJID, status string) {
 	); err != nil {
 		logger.Warnf("Failed to set transcript_status=%s for %s: %v", status, id, err)
 	}
+	switch status {
+	case tsEmpty, tsNoMedia, tsFailed:
+		// tsFailed is retried by the next sweep, but the broadcast doesn't wait
+		// the 10 minutes for it.
+		p.settled(id, chatJID, status)
+	}
+}
+
+func (p *AudioPipeline) settled(id, chatJID, status string) {
+	if p.onSettled != nil {
+		p.onSettled(id, chatJID, status)
+	}
+}
+
+// statusOf returns a row's current transcript_status ("" if unset or missing).
+func (p *AudioPipeline) statusOf(id, chatJID string) string {
+	var status string
+	_ = p.store.db.QueryRow(
+		`SELECT COALESCE(transcript_status, '') FROM messages WHERE id = ? AND chat_jid = ?`,
+		id, chatJID,
+	).Scan(&status)
+	return status
 }
 
 func (p *AudioPipeline) downloadWorker() {
@@ -235,6 +272,11 @@ func (p *AudioPipeline) downloadWorker() {
 var downloadRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 15 * time.Second}
 
 func (p *AudioPipeline) download(job audioJob) {
+	// The same row can be queued twice (live enqueue plus a sweep, e.g. the
+	// offline backlog at startup); only the first job to get here does work.
+	if s := p.statusOf(job.id, job.chatJID); s != tsPending && s != tsFailed {
+		return
+	}
 	var err error
 	for attempt := 0; ; attempt++ {
 		var ok bool
@@ -454,6 +496,11 @@ func (p *AudioPipeline) transcribeWorker() {
 		case <-p.stop:
 			return
 		case job := <-p.transcripts:
+			// Same duplicate-job guard as download. Not inside transcribe
+			// itself, which backfill also calls on pending/failed rows.
+			if p.statusOf(job.id, job.chatJID) != tsDownloaded {
+				continue
+			}
 			p.transcribe(job)
 		}
 	}
@@ -499,6 +546,8 @@ func (p *AudioPipeline) transcribe(job audioJob) {
 	}
 
 	logger.Infof("Transcribed %s in %.1fs (%d chars)", job.id, time.Since(start).Seconds(), len(text))
+	// Released before re-indexing: the broadcast shouldn't wait on bleve.
+	p.settled(job.id, job.chatJID, tsDone)
 
 	// Opened without an index (backfill --skip-index): the transcript is in
 	// SQLite and a following full reindex will pick it up.

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,9 @@ type MessageWithID struct {
 	MediaType string    `json:"media_type,omitempty"`
 	Filename  string    `json:"filename,omitempty"`
 	ReplyToID string    `json:"reply_to_id,omitempty"`
+	// TranscriptStatus is the voice-note pipeline state (transcribe.go's ts*
+	// constants); empty for anything that isn't an uncaptioned voice note.
+	TranscriptStatus string `json:"transcript_status,omitempty"`
 }
 
 // splitAndTrim splits a string by a delimiter and trims whitespace from each element.
@@ -460,6 +465,34 @@ func sendAndTrack(ctx context.Context, conn *websocket.Conn, registry *ClientReg
 	return sendToClient(ctx, conn, msg)
 }
 
+// mergeCatchUp drops still-held voice notes from a catch-up replay and adds
+// released ones the replay doesn't already contain (filtered by channels,
+// same as the live stream), keeping the result oldest-first.
+func mergeCatchUp(missed []BroadcastMessage, held map[string]bool, released []BroadcastMessage, channels []string) []BroadcastMessage {
+	out := missed[:0:0]
+	seen := make(map[string]bool, len(missed))
+	for _, m := range missed {
+		key := holdKey(m.ChatJID, m.Message.ID)
+		if held[key] {
+			logger.Infof("WS catch-up: withholding held voice note id=%s", m.Message.ID)
+			continue
+		}
+		seen[key] = true
+		out = append(out, m)
+	}
+	for _, m := range released {
+		key := holdKey(m.ChatJID, m.Message.ID)
+		if seen[key] || (len(channels) > 0 && !slices.Contains(channels, m.ChatJID)) {
+			continue
+		}
+		logger.Infof("WS catch-up: adding voice note id=%s released while disconnected", m.Message.ID)
+		seen[key] = true
+		out = append(out, m)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Message.Time.Before(out[j].Message.Time) })
+	return out
+}
+
 // lastSeenKey returns the JID bucket a client's last-seen cursor should use
 // for a message on chatJID: unfiltered clients (no jids param) share one
 // global "" cursor, while filtered clients get one cursor per JID so that
@@ -590,6 +623,14 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				logger.Infof("WS catch-up skipped: client=%q (no lastSeen for any subscribed jid)", clientName)
 			}
 		}
+		// Voice notes still held for their transcript are left out — they'll
+		// arrive live, once, with the text. Ones released while this client
+		// was away are added back even if its cursor has already passed them.
+		defer registry.MarkDisconnected(clientName)
+		held, released := broadcaster.catchUpView(registry.LastDisconnected(clientName))
+		if catchUpErr == nil && (len(held) > 0 || len(released) > 0) {
+			missed = mergeCatchUp(missed, held, released, channels)
+		}
 		if catchUpErr != nil {
 			logger.Warnf("WS catch-up query failed for client %q: %v", clientName, catchUpErr)
 		} else if missed != nil {
@@ -626,7 +667,7 @@ func makeWSHandler(broadcaster *MessageBroadcaster, registry *ClientRegistry, st
 				// Always advance last-seen timestamp to avoid replaying
 				// already-seen but filtered messages on reconnect.
 				_ = registry.UpdateLastSeen(clientName, lastSeenKey(channels, msg.ChatJID), msg.Message.Time)
-				logger.Debugf("WS received broadcast: client=%q chat=%q jid=%s id=%d", clientName, msg.ChatName, msg.ChatJID, msg.Message.ID)
+				logger.Debugf("WS received broadcast: client=%q chat=%q jid=%s id=%s", clientName, msg.ChatName, msg.ChatJID, msg.Message.ID)
 				if err := sendToClient(ctx, conn, msg); err != nil {
 					logger.Warnf("WS sendToClient error: client=%q chat=%q err=%v", clientName, msg.ChatName, err)
 					return

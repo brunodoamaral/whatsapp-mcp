@@ -88,6 +88,71 @@ WS handler's `select` never fires on a nil channel — so a client that didn't
 ask for typing events pays no cost (no allocation, no wasted sends) rather
 than receiving-and-discarding.
 
+## Voice notes are held until transcribed (`holdback.go`)
+
+**Why.** Voice notes used to be broadcast on arrival with empty `content`.
+The transcript landed in `messages.content` 20–60 s later, and nothing sent
+an event for that. On 2026-09-24 WhatsDoing (`../../WhatsDoing`) got voice note
+`3A2C376F2F3BA43AB331` (sent 18:18:56). It analyzed the chat at 18:19:08 and
+saw only an empty audio. The bridge logged `Transcribed … in 25.1s` at
+18:19:23, but the message ID never changed, so WhatsDoing never re-analyzed
+the chat, and it created the wrong todo. A consumer that reacts to each
+message needs the text in the one event it gets, so the fix is to delay that
+event. Sending a second "update" event would instead require every consumer
+to handle re-analysis.
+
+**Mechanism.** `dispatchMessage` holds an uncaptioned voice note
+(`awaitsTranscript`: status `pending`/`downloaded`/`retrying`, pipeline
+enabled) in `MessageBroadcaster.held` instead of broadcasting it. The
+pipeline's `onSettled` hook calls `Release` when the note reaches `done`,
+`empty`, `no_media` or `failed`. `failed` releases immediately and doesn't
+wait 10 minutes for the sweep's retry. `Release` re-reads `content` and
+`transcript_status` from SQLite and then calls the unchanged `Broadcast`, so
+fan-out stays non-blocking and the `Broadcast:` log lines are unchanged.
+`Broadcast held:` / `Broadcast released: … reason=` log each hold and its
+release. `transcript_status` is now part of `MessageWithID`, both live and
+in catch-up.
+
+**Exactly once comes from the hold map, not from the pipeline.** `Release`
+is a no-op for anything not currently held. A transcript that finishes after
+the cap, a sweep retry of a `failed` row, and a sweep over a backlog of old
+`pending` rows therefore never broadcast. A redelivered event for a held ID
+is not held twice. The hold is registered *before* the note is enqueued, so
+the pipeline can't settle it before there's a hold to release. Duplicate jobs
+(live enqueue plus sweep, now more likely because the pipeline is created
+before connect) are skipped in the workers by re-checking the status.
+
+**Cap: 4 minutes (`broadcastHoldCap`).** An average note takes ~30 s on this
+Pi, and the longest ones take a few minutes. Whisper's own 20-minute timeout
+is far too long to keep a message waiting. After the cap, the message goes
+out with its in-progress status and never goes out again.
+
+**Catch-up had to change too, or the hold would leak around it.** A client
+that reconnects while a note is held would otherwise get the empty row from
+SQLite and then the live release: two deliveries, the first one empty. So
+`mergeCatchUp` withholds held notes. A client that disconnects *during* a
+hold has a second problem: later messages may already have moved its cursor
+past the note's timestamp, so the SQLite replay would miss the note. For this
+case, releases are kept in memory for 30 minutes, and each client name's last
+disconnect time (`ClientRegistry.disconnectedAt`, also in memory) is tracked.
+Releases that happened after that disconnect are added to the replay,
+deduplicated by ID.
+
+**Restarts.** Holds are in memory. At startup, `rehold` re-parks voice notes
+that are still unsettled and less than one cap old, for the rest of their cap.
+Older ones are never broadcast live. They were either released before the
+restart or, if the bridge was down for longer than the cap, clients get them
+through the SQLite catch-up on reconnect. The pipeline is now created, and
+`Prepare`d, before the event handler is attached, so the offline backlog
+delivered at connect is held like live traffic. Its workers still start after
+connect, as before.
+
+**Outbound voice notes** (`is_from_me`, sent from the phone or another linked
+device) arrive as ordinary `events.Message` and take the same path, so they
+are held too. WhatsDoing's `on_outbound` needs their text. Messages sent
+*through this bridge's* `/api/send` are not echoed back by whatsmeow and were
+never broadcast, before or after this change.
+
 ## `GET /api/contacts/{jid}/avatar` (`avatar.go`)
 
 **Why a second endpoint instead of changing `/profile-picture`.** The
