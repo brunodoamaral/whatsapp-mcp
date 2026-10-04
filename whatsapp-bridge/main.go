@@ -96,6 +96,7 @@ func main() {
 	backfill := flag.Bool("transcribe-backfill", false, "transcribe all voice notes whose media is already on disk, then exit")
 	backfillDays := flag.Int("transcribe-since-days", 0, "limit --transcribe-backfill to messages from the last N days (0 = all)")
 	skipIndex := flag.Bool("skip-index", false, "with --transcribe-backfill: write transcripts to SQLite only, leaving the bleve index untouched so the bridge can keep running (requires a later --reindex all)")
+	migrateBroadcast := flag.Bool("migrate-broadcast-chats", false, "move messages stored under broadcast-list chats into the sender's DM chat, fix raw-number chat names, then exit (run with the service stopped)")
 	pairPhone := flag.String("pair-phone", "", "when logging in, request an 8-digit pairing code for this phone number (international format, digits only, e.g. 15551234567) instead of showing a QR code")
 	flag.Parse()
 
@@ -111,6 +112,21 @@ func main() {
 		}
 		if err := RunTranscribeBackfill(messageStore, *maxRows, *backfillDays); err != nil {
 			logger.Errorf("Backfill failed: %v", err)
+			messageStore.Close()
+			os.Exit(1)
+		}
+		messageStore.Close()
+		os.Exit(0)
+	}
+
+	if *migrateBroadcast {
+		messageStore, err := NewMessageStore()
+		if err != nil {
+			logger.Errorf("Failed to initialise message store: %v", err)
+			os.Exit(1)
+		}
+		if err := RunMigrateBroadcastChats(messageStore); err != nil {
+			logger.Errorf("Broadcast-chat migration failed: %v", err)
 			messageStore.Close()
 			os.Exit(1)
 		}

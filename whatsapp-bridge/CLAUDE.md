@@ -393,6 +393,68 @@ immediately before the request is built. This is safe because `BooleanQuery`
 and `DisjunctionQuery` both ignore their own `BoostVal` when constructing
 searchers — on a container query the boost is fusion weight and nothing else.
 
+## Broadcast-list messages go to the sender's DM chat (`events.go`, `migrate_broadcast.go`)
+
+**Why.** WhatsDoing showed a todo whose contact was a raw number
+(`77464181153804`) instead of "Andrea Cereijo". Her party invite had been sent
+to a *broadcast list*, and the bridge stored it under the list's JID
+(`1571572178@broadcast`). That made a phantom chat named after her LID, with
+no avatar, no `wa.me` link, and a reply target that isn't a DM.
+whatsmeow's `MessageSource.IsIncomingBroadcast()` documents the right
+semantics: such a message "shows up in the direct chat with the Sender".
+That is what the WhatsApp app does, so it is what the bridge does now.
+
+**`directChatJID`** returns `Sender.ToNonAD()` when
+`IsIncomingBroadcast() && !IsFromMe`, and `Chat` otherwise. Everything
+downstream (chats/messages rows, WS broadcast, holdback, media dir, index)
+follows from that one JID. The explicit `!IsFromMe` keeps our *own* sends to
+our own lists in the list chat. `IsIncomingBroadcast`'s second clause (about
+`BroadcastListOwner` on our own sends) is about read receipts and is not
+relied on. `status@broadcast` isn't a broadcast list (`IsBroadcastList`
+excludes it), so statuses are unaffected. History sync still stores
+list conversations under the list JID. It only runs at pairing, so that
+was left alone.
+
+**Names resolve LID → PN (`contactDisplayName`).** The address-book name lives
+on the *phone-number* contact. The `@lid` contact usually only carries a push
+name. The order is: FullName of the JID → FullName of its PN (for a `@lid`,
+via `Store.LIDs.GetPNForLID`) → push name of the JID → push name of the PN.
+It is used both for the chat name and for each message's sender name. This is a visible
+change for existing LID chats too. They take the address-book name on their
+next message ("Jeferson Veloso" → "Jeferson Veloso Gerente Santander"), the
+same as the WhatsApp app shows. That was chosen deliberately over "only fill raw numbers".
+
+**`--migrate-broadcast-chats`** fixes the rows stored before this change. Run
+it with the service stopped (bleve's exclusive lock) and after a backup of
+`store/messages.db*`, `whatsapp.db` and `messages.bleve`. It is idempotent: a
+second run logs all zeros. For each non-status list chat with a single sender,
+the target is that sender's DM chat in the form live DMs use (`<sender>@lid`
+when lid_map knows the LID, else a known PN). Lists with our own messages, or
+with more than one sender, are skipped, never guessed at. Things to know:
+
+- **Dedupe is against both forms of the DM chat.** The same message ID can
+  already sit in the sender's *other-form* chat. Andrea's 15/03 message was in
+  her PN chat and in a list, and 4 of Pipoca's were too. A check against the
+  LID target alone would have made a third copy. So a list row is dropped when
+  its ID exists in the target *or* its PN↔LID twin.
+- The target `chats` row is created *before* the `UPDATE`, because
+  `messages.chat_jid` has a FK to `chats(jid)`. When nothing is left to move,
+  no target row is created at all.
+- Search docs for lists are deleted by a `RegexpQuery` on `chat_jid`
+  (`[0-9]+@broadcast`, so status is excluded) against the *index*, not the
+  migrated rows. A crash between the SQL commit and the bleve step therefore
+  still cleans up on rerun. Targets are then partially reindexed. A full
+  reindex is not needed and would mean hours of re-embedding on the Pi.
+- It also renames DM chats still named after their own number wherever the
+  same name chain now resolves something.
+
+**Partial reindex now really deletes first.** `reIndexAllMessages`'s doc
+comment always said a chat-filtered run deletes the chat's existing docs
+first, but nothing did. It only overwrote `chatJID:group` keys. That was fine
+until messages could be added out of timestamp order (which shifts group
+boundaries) or a chat could vanish. `deleteChatDocs` / `deleteDocsMatching`
+(`search.go`) now make it true.
+
 ## Not done, on purpose
 
 Row-level or query-level auth/audit beyond "not intended to be reachable

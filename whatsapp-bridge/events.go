@@ -15,17 +15,17 @@ import (
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) *BroadcastMessage {
-	// Save message to database
-	chatJID := msg.Info.Chat.String()
+	// Save message to database. A message sent to a broadcast list we're on
+	// is stored in the sender's DM chat, which is where WhatsApp shows it.
+	chatJ := directChatJID(msg.Info)
+	chatJID := chatJ.String()
 	sender := msg.Info.Sender.User
 	var senderName string
 
-	// Just use contact info (full name) - try this first
-	contact, err := client.Store.Contacts.GetContact(context.Background(), msg.Info.Sender)
-	if err == nil && contact.FullName != "" {
-		senderName = contact.FullName
-	} else if contact.PushName != "" {
-		senderName = contact.PushName
+	// Address-book name first (resolving a @lid to its phone-number contact),
+	// then push name
+	if name := contactDisplayName(client, msg.Info.Sender.ToNonAD()); name != "" {
+		senderName = name
 	} else if sender != "" {
 		// Fallback to sender
 		senderName = sender
@@ -42,7 +42,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, chatJ, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	errChat := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -65,7 +65,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	replyToID := extractReplyToID(msg.Message)
 
 	// Store message in database with contact's full name for indexing
-	err = messageStore.StoreMessage(
+	err := messageStore.StoreMessage(
 		msg.Info.ID,
 		chatJID,
 		sender,
@@ -134,6 +134,43 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 }
 
+// directChatJID returns the chat a message belongs to. A message sent to a
+// broadcast list we're a recipient of belongs to the sender's DM chat: per
+// whatsmeow's IsIncomingBroadcast, that is where WhatsApp shows it. Our own
+// sends to our own lists stay in the list chat, and status@broadcast is not a
+// broadcast list, so it passes through unchanged.
+func directChatJID(info types.MessageInfo) types.JID {
+	if info.IsIncomingBroadcast() && !info.IsFromMe {
+		return info.Sender.ToNonAD()
+	}
+	return info.Chat
+}
+
+// contactDisplayName returns the best stored name for a user JID, or "".
+// Address-book names win over push names, and a @lid is resolved to its
+// phone-number contact, because the address-book name is stored on the PN
+// contact while the LID contact usually only carries a push name.
+func contactDisplayName(client *whatsmeow.Client, jid types.JID) string {
+	ctx := context.Background()
+	contact, _ := client.Store.Contacts.GetContact(ctx, jid)
+	if contact.FullName != "" {
+		return contact.FullName
+	}
+	var pnContact types.ContactInfo
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			pnContact, _ = client.Store.Contacts.GetContact(ctx, pn)
+			if pnContact.FullName != "" {
+				return pnContact.FullName
+			}
+		}
+	}
+	if contact.PushName != "" {
+		return contact.PushName
+	}
+	return pnContact.PushName
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// Always try to get the current name first, then check database as fallback
@@ -188,14 +225,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		tracef("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name) - try this first
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		if name = contactDisplayName(client, jid); name != "" {
 			tracef("Found contact name: %s", name)
-		} else if contact.PushName != "" {
-			name = contact.PushName
-			tracef("Using push name: %s", name)
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender

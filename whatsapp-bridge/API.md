@@ -472,3 +472,9 @@ Push name events are not persisted and are not replayed by catch-up.
 
 - Individual: `5511999999999@s.whatsapp.net`
 - Group: `123456789-1234567890@g.us`
+- Individual (LID): `77464181153804@lid` — how most DMs arrive today
+- Status updates: `status@broadcast`
+
+Broadcast lists (`<digits>@broadcast`) never appear as a chat. A message
+someone sends to a list you're on is stored and delivered under the
+sender's DM chat, which is where the WhatsApp app shows it.

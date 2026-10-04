@@ -722,6 +722,39 @@ const (
 // embBatch is defined in embedding.go
 )
 
+// deleteDocsMatching deletes every bleve doc matched by q and returns how many
+// were deleted. It re-runs the query from offset 0 after each batch, since the
+// batch removes what it just matched.
+func deleteDocsMatching(index bleve.Index, q query.Query) (int, error) {
+	const page = 1000
+	deleted := 0
+	for {
+		req := bleve.NewSearchRequestOptions(q, page, 0, false)
+		res, err := index.Search(req)
+		if err != nil {
+			return deleted, err
+		}
+		if len(res.Hits) == 0 {
+			return deleted, nil
+		}
+		batch := index.NewBatch()
+		for _, hit := range res.Hits {
+			batch.Delete(hit.ID)
+		}
+		if err := index.Batch(batch); err != nil {
+			return deleted, err
+		}
+		deleted += len(res.Hits)
+	}
+}
+
+// deleteChatDocs deletes every bleve doc belonging to chatJID.
+func deleteChatDocs(index bleve.Index, chatJID string) (int, error) {
+	q := bleve.NewTermQuery(chatJID)
+	q.SetField("chat_jid")
+	return deleteDocsMatching(index, q)
+}
+
 // reIndexAllMessages re-indexes messages from the database into bleve.
 // When chatFilter is non-empty, only chats whose JID contains the filter string
 // (case-insensitive LIKE match) are processed, existing bleve docs for those
@@ -860,6 +893,16 @@ func reIndexAllMessages(store *MessageStore, maxRows int, chatFilter string) err
 	}
 	chatRows.Close()
 
+	// A partial reindex rewrites each chat from scratch, so drop its existing
+	// docs first: group boundaries move when messages are added or removed
+	// out of timestamp order, and a stale group doc would otherwise linger.
+	if chatFilter != "" {
+		for _, jid := range chatJIDs {
+			if _, err := deleteChatDocs(store.index, jid); err != nil {
+				logger.Warnf("Failed to clear existing docs for %s: %v", jid, err)
+			}
+		}
+	}
 
 	for _, jid := range chatJIDs {
 		if maxRows > 0 && indexed >= maxRows {
