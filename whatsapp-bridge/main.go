@@ -493,6 +493,10 @@ func main() {
 		logger.Errorf("Failed to init avatar cache database: %v", err)
 	}
 
+	// Periodic Go-vs-native memory split in the log, and opt-in pprof.
+	startMemReporter()
+	startPprofServer()
+
 	// Start REST API server
 	startRESTServer(client, messageStore, broadcaster, registry, 8080)
 

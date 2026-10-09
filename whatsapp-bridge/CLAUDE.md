@@ -461,3 +461,51 @@ Row-level or query-level auth/audit beyond "not intended to be reachable
 beyond localhost" (per `API.md`) — this bridge has no auth model at all for
 any endpoint, so `/api/query` isn't a new category of exposure, just a wider
 one on an already-trusted local surface.
+
+## Memory-freeze incident (2026-10-07/08) and the embedder
+
+The host (8 GB Pi 5) froze for ~20h on 2026-10-07/08: RAM and both swapfiles were fully
+consumed until the kernel OOM-killed this service (≈1.2 GiB anon RSS + ≈1.26 GiB swap at
+~35h uptime, the largest consumer on the box). A restarted instance reached the same size
+in ~3h on 2026-10-09. `/proc/PID/smaps` showed ~90 MB of Go heap and ~2.1 GB of C heap.
+
+**Root cause: one ONNX Runtime session per sequence-length bucket (`embedding.go`).**
+The `Embedder` used to cache a fixed-shape `ort.AdvancedSession` for each of the 12
+`seqLenBuckets`, created the first time a batch of that padded length appeared. Every ORT
+session loads and optimizes its *own* copy of the 113 MB qint8 model, so each new bucket
+added ~130–200 MB of **C heap**. Measured: 12 buckets ≈ +1.8 GB. That is why the growth was
+step-shaped (a step per first-seen bucket; long texts are rare, so the last steps came
+hours or days in) rather than a steady leak, and why the Go heap stayed at ~90 MB while
+the process sat at 2.5 GB. Go pprof would not have shown it.
+
+It is now **one `ort.DynamicAdvancedSession`**, with ORT's CPU arena and memory-pattern
+cache off so per-shape activation buffers are freed after each run. Input tensors are
+built per call. Bucketing and the padding to `embBatch` rows are kept on purpose: the
+qint8 model quantizes activations per tensor, so padding moves outputs slightly (~0.997
+cosine). Keeping the same shapes keeps new vectors identical (≥0.9999) to the ones already
+in `messages.bleve`, so no reindex was needed. Do not reintroduce per-shape sessions.
+
+**glibc malloc is pinned in `memstats.go`'s `init`** (`M_MMAP_THRESHOLD=128K`,
+`M_ARENA_MAX=2`). With the arena off, ORT frees and reallocates multi-MB buffers on
+whichever OS thread the cgo call lands on. glibc's *dynamic* mmap threshold then climbs to
+32 MB, and those buffers fragment across up to 8×cores per-thread arenas. Over 300 mixed
+batches the default swung between 550 and 935 MB, while the pinned threshold stayed flat
+at ~260 MB at the same speed. It is set in code, not in the unit's environment, so it
+can't be lost in a unit edit.
+
+`TestEmbedderMemory` (`embedding_mem_test.go`, opt-in with `EMB_MEM_TEST=1`; it loads
+the real model) is the regression guard. It logs anonymous memory per bucket and over
+mixed batches, and `EMB_VEC_OUT`/`EMB_VEC_REF` compare vectors across a refactor. At
+runtime the bridge logs `Embedding: first batch at seqLen=… mem=…` once per bucket, and
+every 10 min `Memory: anon=… go_sys=… go_heap=… c≈…`. Here anon is RssAnon+VmSwap, and
+file-mapped cache such as bleve segments is excluded. If `c≈` grows the leak is native;
+if `go_sys` grows, set `PPROF_ADDR=127.0.0.1:6060` in the unit and diff
+`go tool pprof -base` heap snapshots. pprof gets its own localhost listener because
+the REST router binds all interfaces.
+
+Guardrails kept after the incident: the service is capped via user drop-in
+`~/.config/systemd/user/whatsapp-bridge.service.d/memory.conf` (`MemoryHigh=1.5G`,
+`MemoryMax=2G`, `MemorySwapMax=1G`), so a leak kills and restarts only this service, and
+earlyoom runs host-wide. Note that sitting at `MemoryHigh` throttles the bridge into
+multi-second `Node handling took …` stalls long before `MemoryMax` kills it, so treat
+those warnings as a memory signal too.
