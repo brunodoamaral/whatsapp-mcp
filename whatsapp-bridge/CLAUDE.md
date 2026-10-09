@@ -455,6 +455,58 @@ until messages could be added out of timestamp order (which shifts group
 boundaries) or a chat could vanish. `deleteChatDocs` / `deleteDocsMatching`
 (`search.go`) now make it true.
 
+## Historical voice-note transcripts and reindexing on lnx (2026-10-09)
+
+**Where the old transcripts came from.** About 9k voice notes from before the
+pipeline existed had empty `content`. Their media had expired, so the bridge
+could not transcribe them. The ASR dataset on lnx
+(`/data/datasets/audio-whatsapp`) already had Whisper large-v3 text for most
+of them, extracted from an iPhone backup. 7,543 rows were imported, with
+`transcript_status` `done`, or `empty` when the human-reviewed corrections
+left nothing. The join is the media UUID: the dataset's `wav_path` stem equals
+`messages.filename` minus the extension. The dataset's own `id` is a path hash,
+not a message id. The dataset's chunk-level `exclude_ids` were applied only
+for human "both_bad" verdicts and hallucinations, not for its `filterD:*`
+training-quality filters. Text that is bad for training is still better than
+nothing for search. The script and list are in `/data/whatsapp-bridge-work`
+on lnx (`build_import.py`, `import.jsonl`).
+
+**A full reindex runs on lnx, not the Pi.** `--reindex all` works on
+`store/` relative to the working directory, so a separate cwd with copied DBs
+builds a separate index and leaves the live one untouched. No index-path flag
+is needed. Never run that binary without `--reindex` (or another exit-early
+flag): it would log in as this WhatsApp device. Two knobs exist for it.
+`ortTarball()` picks the x64 ONNX Runtime on amd64. `EMBED_THREADS` raises
+ORT's intra-op threads (default 1, which is right for the Pi). With 24
+threads, 659k messages took about 80 min, against hours on the Pi. FAISS for
+the x86 build is the blevesearch fork built into `~/opt/faiss` on lnx. Build
+with `CGO_LDFLAGS="-L$HOME/opt/faiss/lib -Wl,-rpath,$HOME/opt/faiss/lib"`,
+since `libfaiss_c.so` has no rpath for `libfaiss.so`.
+
+**x86 vectors are compatible enough.** The same `model_qint8_arm64.onnx`
+embeds at 0.998–0.9998 cosine against the Pi's output (`TestEmbedderMemory`
+with `EMB_VEC_OUT`/`EMB_VEC_REF`). That is above the ~0.997 the Pi itself
+already has between a single-text query embedding and a padded-batch document
+embedding.
+
+**The GPU (RTX 3090 on lnx) was tried and is not worth it.** With the GPU
+build of ONNX Runtime and the CUDA provider, the qint8 model ran *slower*
+than the CPU: 30k rows took 256–518 s against 153 s, at ~0% GPU utilization.
+Its quantized ops fall back to the CPU, with copies in between. The fp32
+`onnx/model.onnx` does run on the GPU (80 s per 30k rows, where bleve becomes
+the bottleneck). But its document vectors are only 0.986–0.998 cosine to the
+Pi's qint8 query vectors, and the Pi keeps indexing live messages with qint8.
+That was declined in favour of compatibility. Bigger batches don't help
+either: padding rows don't move the vectors, but the reindex embeds one chat
+at a time, so most calls are short anyway. CUDA 12 and cuDNN 9 for any future
+attempt are user-space on lnx: `/usr/local/cuda/targets/x86_64-linux/lib`, and
+cuDNN in a conda env's `site-packages/nvidia/cudnn/lib`. The GPU ORT is in
+`~/opt/ort-gpu`.
+
+**Cutover** stops the service, partially reindexes on lnx (`--reindex <jid>`)
+every chat with rows newer than the snapshot, and swaps the directory. The
+previous index is kept as `store/messages.bleve.pre-import`.
+
 ## Not done, on purpose
 
 Row-level or query-level auth/audit beyond "not intended to be reachable

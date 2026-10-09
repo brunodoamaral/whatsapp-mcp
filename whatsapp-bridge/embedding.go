@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +28,6 @@ const (
 	// ONNX Runtime release that matches onnxruntime_go v1.27.0 C API headers.
 	ortVersion = "1.24.1"
 	ortBaseURL = "https://github.com/microsoft/onnxruntime/releases/download/v" + ortVersion + "/"
-	ortTarball = "onnxruntime-linux-aarch64-" + ortVersion + ".tgz"
 	ortLibName = "libonnxruntime.so." + ortVersion
 
 	// embBatch is the number of texts per ONNX inference call. The persistent
@@ -202,7 +202,12 @@ func newEmbeddingSession(onnxPath string, inputNames []string, outName string) (
 	defer opts.Destroy()
 	// Embedding here is small batches on a low-core box, so single-threaded
 	// sequential execution is plenty and keeps the OS thread count flat.
-	if err := opts.SetIntraOpNumThreads(1); err != nil {
+	// EMBED_THREADS raises it for a one-off --reindex on a bigger machine.
+	threads := 1
+	if v, err := strconv.Atoi(os.Getenv("EMBED_THREADS")); err == nil && v > 0 {
+		threads = v
+	}
+	if err := opts.SetIntraOpNumThreads(threads); err != nil {
 		return nil, fmt.Errorf("set intra-op threads: %w", err)
 	}
 	if err := opts.SetInterOpNumThreads(1); err != nil {
@@ -458,6 +463,16 @@ func l2Normalize(v []float32) {
 	}
 }
 
+// ortTarball names the ONNX Runtime release for this machine. The bridge runs on
+// arm64, but a one-off --reindex can run on an amd64 box (see CLAUDE.md).
+func ortTarball() string {
+	arch := "aarch64"
+	if runtime.GOARCH == "amd64" {
+		arch = "x64"
+	}
+	return "onnxruntime-linux-" + arch + "-" + ortVersion + ".tgz"
+}
+
 func ensureONNXRuntime() (string, error) {
 	sysPaths := []string{
 		"/usr/lib/aarch64-linux-gnu/" + ortLibName,
@@ -486,7 +501,7 @@ func ensureONNXRuntime() (string, error) {
 	if err := os.MkdirAll(ortDir, 0o755); err != nil {
 		return "", fmt.Errorf("create cache dir: %w", err)
 	}
-	url := ortBaseURL + ortTarball
+	url := ortBaseURL + ortTarball()
 	if err := downloadAndExtractORT(url, ortDir, ortLibName); err != nil {
 		return "", fmt.Errorf("download ONNX Runtime: %w", err)
 	}
